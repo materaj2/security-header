@@ -8,14 +8,15 @@ This manual explains how to apply security header and secure cookie configuratio
 
 1. [Overview of Security Headers](#1-overview-of-security-headers)
 2. [Overview of Secure Cookie Flags](#2-overview-of-secure-cookie-flags)
-3. [Node.js (Express)](#3-nodejs-express)
-4. [AngularJS](#4-angularjs)
-5. [Next.js](#5-nextjs)
-6. [Apache HTTP Server](#6-apache-http-server)
-7. [Nginx](#7-nginx)
-8. [Apache Tomcat](#8-apache-tomcat)
-9. [Verification](#9-verification)
-10. [Troubleshooting](#10-troubleshooting)
+3. [TLS/HTTPS Security](#3-tlshttps-security)
+4. [Node.js (Express)](#4-nodejs-express)
+5. [AngularJS](#5-angularjs)
+6. [Next.js](#6-nextjs)
+7. [Apache HTTP Server](#7-apache-http-server)
+8. [Nginx](#8-nginx)
+9. [Apache Tomcat](#9-apache-tomcat)
+10. [Verification](#10-verification)
+11. [Troubleshooting](#11-troubleshooting)
 
 ---
 
@@ -54,7 +55,63 @@ All configurations enforce these cookie security attributes:
 
 ---
 
-## 3. Node.js (Express)
+## 3. TLS/HTTPS Security
+
+Properly configuring TLS is the foundation of HTTPS security. Without secure TLS settings, security headers and cookie flags are meaningless because the transport layer itself is compromised.
+
+### Why TLS Configuration Matters
+
+| Risk | Impact |
+|------|--------|
+| Outdated TLS versions (1.0, 1.1) | Vulnerable to POODLE, BEAST, and other attacks |
+| Weak cipher suites (RC4, DES, 3DES) | Traffic can be decrypted by attackers |
+| No forward secrecy | Past traffic can be decrypted if private key is compromised |
+| Expired or misconfigured certificates | Browsers show warnings, users lose trust |
+| Missing OCSP stapling | Slower connections, privacy concerns |
+
+### Minimum TLS Requirements
+
+- **Protocols:** Only TLS 1.2 and TLS 1.3 (disable SSL 2.0, SSL 3.0, TLS 1.0, TLS 1.1)
+- **Ciphers:** AEAD ciphers with ECDHE key exchange (GCM, CHACHA20-POLY1305)
+- **Certificates:** RSA 2048-bit minimum (4096 recommended) or ECDSA P-256+
+- **OCSP Stapling:** Enabled for performance and privacy
+- **HSTS:** Enabled with `max-age=31536000; includeSubDomains; preload`
+
+### Quick TLS Testing Commands
+
+```bash
+# Check TLS version and cipher in use
+curl -vI https://your-domain.com 2>&1 | grep -E "SSL connection|TLS|cipher"
+
+# Verify TLS 1.0/1.1 are disabled (should fail)
+openssl s_client -connect your-domain.com:443 -tls1
+openssl s_client -connect your-domain.com:443 -tls1_1
+
+# Check certificate expiration
+echo | openssl s_client -connect your-domain.com:443 -servername your-domain.com 2>/dev/null | \
+  openssl x509 -noout -dates
+
+# Full scan with testssl.sh
+./testssl.sh your-domain.com
+
+# Online: SSL Labs (aim for A+ grade)
+# https://www.ssllabs.com/ssltest/analyze.html?d=your-domain.com
+```
+
+### Detailed TLS Guide
+
+For comprehensive TLS configuration including:
+- Server-specific configurations (Nginx, Apache, Tomcat, Node.js)
+- Certificate management with Let's Encrypt
+- Common TLS vulnerabilities and how to fix them
+- Complete best practices checklist
+- Troubleshooting guide
+
+See the dedicated guide: **[`tls_security_guide.md`](tls_security_guide.md)**
+
+---
+
+## 4. Node.js (Express)
 
 **File:** `nodejs_security_config.js`
 
@@ -115,7 +172,7 @@ applySecurityHeaders(app);
 
 ---
 
-## 4. AngularJS
+## 5. AngularJS
 
 **File:** `angularjs_security_config.js`
 
@@ -179,7 +236,7 @@ angular.module('myApp', ['ngSanitize', 'appSecurity']);
 
 ---
 
-## 5. Next.js
+## 6. Next.js
 
 **File:** `nextjs_security_config.js`
 
@@ -258,7 +315,7 @@ Use the cookie-setting pattern from Part 3 in your API route handlers.
 
 ---
 
-## 6. Apache HTTP Server
+## 7. Apache HTTP Server
 
 **File:** `apache_security.conf`
 
@@ -328,7 +385,7 @@ sudo systemctl reload apache2
 
 ---
 
-## 7. Nginx
+## 8. Nginx
 
 **File:** `nginx_security.conf`
 
@@ -403,7 +460,7 @@ Solutions:
 
 ---
 
-## 8. Apache Tomcat
+## 9. Apache Tomcat
 
 **File:** `tomcat_security_config.xml`
 
@@ -485,7 +542,7 @@ sudo systemctl restart tomcat
 
 ---
 
-## 9. Verification
+## 10. Verification
 
 After applying configurations, verify your security headers using the scanner:
 
@@ -513,6 +570,37 @@ curl -sI https://your-domain.com | grep -i "strict-transport-security"
 curl -sI https://your-domain.com | grep -i "set-cookie"
 ```
 
+### TLS Verification
+
+```bash
+# Quick TLS check - verify TLS version and cipher
+curl -vI https://your-domain.com 2>&1 | grep -E "SSL connection|TLS"
+
+# Verify only TLS 1.2+ is enabled
+openssl s_client -connect your-domain.com:443 -tls1_2 </dev/null 2>&1 | grep "Protocol"
+openssl s_client -connect your-domain.com:443 -tls1_3 </dev/null 2>&1 | grep "Protocol"
+
+# Verify TLS 1.0/1.1 are disabled (should fail)
+openssl s_client -connect your-domain.com:443 -tls1 </dev/null 2>&1 | grep -i "error\|alert"
+openssl s_client -connect your-domain.com:443 -tls1_1 </dev/null 2>&1 | grep -i "error\|alert"
+
+# Check certificate expiration
+echo | openssl s_client -connect your-domain.com:443 -servername your-domain.com 2>/dev/null | \
+  openssl x509 -noout -dates
+
+# Verify OCSP Stapling
+openssl s_client -connect your-domain.com:443 -servername your-domain.com -status </dev/null 2>/dev/null | \
+  grep -A3 "OCSP Response"
+
+# Check HTTP to HTTPS redirect
+curl -sI http://your-domain.com | grep -i "location"
+
+# Full scan (online)
+# Visit: https://www.ssllabs.com/ssltest/analyze.html?d=your-domain.com
+```
+
+For a comprehensive TLS testing guide with additional tools (testssl.sh, nmap, sslyze), see **[`tls_security_guide.md`](tls_security_guide.md)**.
+
 ### Expected Results
 
 A properly configured server should show:
@@ -538,7 +626,7 @@ Set-Cookie: session=...; Secure; HttpOnly; SameSite=Strict; Path=/
 
 ---
 
-## 10. Troubleshooting
+## 11. Troubleshooting
 
 ### Common Issues
 
@@ -572,3 +660,11 @@ Set-Cookie: session=...; Secure; HttpOnly; SameSite=Strict; Path=/
 **Next.js specific**
 - `unsafe-eval` is required in development mode; use nonce-based CSP in production
 - Static assets under `/_next/static/` should have different cache headers than HTML pages
+
+**TLS/HTTPS issues**
+- Certificate chain errors: Use `fullchain.pem` (not just `cert.pem`) in your server config
+- "SSL certificate has expired": Run `sudo certbot renew --force-renewal` and reload your server
+- Mixed content warnings: Search your code for `http://` references and change them to `https://` or use `upgrade-insecure-requests` in CSP
+- TLS 1.0/1.1 still enabled: Double-check `ssl_protocols` (Nginx) or `SSLProtocol` (Apache) directive
+- OCSP stapling not working: Verify `ssl_trusted_certificate` points to the chain file and DNS resolver is reachable
+- For detailed TLS troubleshooting, see **[`tls_security_guide.md`](tls_security_guide.md)**

@@ -84,3 +84,13 @@ http://internal-app.local:8080
 - **MEDIUM** - Misconfigured headers, missing recommended headers
 - **LOW** - Information leakage, cosmetic issues
 - **OK** - Header present and correctly configured
+
+## TLS/HTTPS Security Configuration
+
+The `example_configuration/` directory includes server-specific security configurations and a dedicated **TLS/HTTPS Security Guide** (`tls_security_guide.md`) covering:
+
+- **Testing TLS**: How to check your TLS configuration using OpenSSL, testssl.sh, Nmap, SSL Labs, and other tools
+- **Server Configuration**: Secure TLS setup for Nginx, Apache, Tomcat, and Node.js
+- **Certificate Management**: Obtaining, renewing, and monitoring certificates with Let's Encrypt
+- **Vulnerability Prevention**: Protection against POODLE, BEAST, CRIME, Heartbleed, DROWN, and other TLS attacks
+- **Best Practices Checklist**: Complete checklist for secure HTTPS deployment
