@@ -8,6 +8,7 @@ Checks a list of URLs for:
 
 Usage:
   python3 web_security_scanner.py -i urls.txt -o results.csv
+  python3 web_security_scanner.py -i urls.txt -o results.txt --format txt
   python3 web_security_scanner.py -i urls.txt -o results.csv --timeout 15 --threads 5
 
 Author: Security Lab Tool
@@ -633,6 +634,99 @@ def scan_url(url, session, use_retire=False, timeout=15):
     return result
 
 
+def generate_recommendations(result):
+    """Build remediation recommendations from a result's findings."""
+    recs = []
+
+    for f in result["header_findings"]:
+        # Missing security header
+        m = re.match(r"\[(?:HIGH|MEDIUM)\] ([^:]+): MISSING", f)
+        if m:
+            header = m.group(1).strip()
+            cfg = SECURITY_HEADERS.get(header)
+            if cfg:
+                recs.append(f"Add '{header}' header. Recommended: {cfg['recommended']}")
+            continue
+
+        # Misconfigured security header
+        m = re.match(r"\[MEDIUM\] ([^:]+): MISCONFIGURED", f)
+        if m:
+            header = m.group(1).strip()
+            cfg = SECURITY_HEADERS.get(header)
+            if cfg:
+                recs.append(
+                    f"Fix '{header}' configuration. Recommended: {cfg['recommended']}"
+                )
+            continue
+
+        # Information leakage headers
+        m = re.match(r"\[LOW\] ([^:]+): PRESENT", f)
+        if m:
+            header = m.group(1).strip()
+            recs.append(
+                f"Remove or obfuscate '{header}' header to avoid leaking server info."
+            )
+            continue
+
+        # No HTTPS
+        if "[HIGH] HTTPS:" in f:
+            recs.append(
+                "Enable HTTPS and redirect all HTTP traffic to HTTPS; deploy a valid TLS certificate."
+            )
+            continue
+
+        # Cookie issues
+        if "[MEDIUM] Set-Cookie:" in f:
+            recs.append(
+                "Set 'Secure', 'HttpOnly', and 'SameSite' attributes on all cookies."
+            )
+            continue
+
+        # SSL/TLS errors
+        if "[CRITICAL] SSL/TLS Error" in f:
+            recs.append(
+                "Resolve SSL/TLS configuration issues (valid certificate chain, supported protocols)."
+            )
+            continue
+
+    # JS library vulnerabilities
+    for f in result["js_findings"]:
+        m = re.match(r"\[(?:CRITICAL|HIGH|MEDIUM|LOW)\] ([^ ]+) v([^:]+):", f)
+        if m:
+            lib, ver = m.group(1), m.group(2).strip()
+            recs.append(
+                f"Upgrade {lib} (current v{ver}) to the latest patched version."
+            )
+
+    # Deduplicate while preserving order
+    seen = set()
+    unique = []
+    for r in recs:
+        if r not in seen:
+            seen.add(r)
+            unique.append(r)
+    return unique
+
+
+def count_severities(result):
+    """Return (critical, high, medium, low) counts for a result."""
+    all_findings = result["header_findings"] + result["js_findings"]
+    critical = sum(1 for f in all_findings if "[CRITICAL]" in f)
+    high = sum(1 for f in all_findings if "[HIGH]" in f)
+    medium = sum(1 for f in all_findings if "[MEDIUM]" in f)
+    low = sum(1 for f in all_findings if "[LOW]" in f)
+    return critical, high, medium, low
+
+
+def has_issues(result):
+    all_findings = result["header_findings"] + result["js_findings"]
+    return any(
+        tag in f
+        for f in all_findings
+        for tag in ["[CRITICAL]", "[HIGH]", "[MEDIUM]", "[LOW]"]
+    )
+
+
 def format_findings(result):
     """Format all findings into a single string for CSV output."""
     lines = []
@@ -654,12 +748,7 @@ def format_findings(result):
     else:
         lines.append("  No JS libraries detected / No findings.")
 
-    # Summary counts
-    all_findings = result["header_findings"] + result["js_findings"]
-    critical = sum(1 for f in all_findings if "[CRITICAL]" in f)
-    high = sum(1 for f in all_findings if "[HIGH]" in f)
-    medium = sum(1 for f in all_findings if "[MEDIUM]" in f)
-    low = sum(1 for f in all_findings if "[LOW]" in f)
+    critical, high, medium, low = count_severities(result)
 
     lines.append("")
     lines.append(
@@ -669,6 +758,71 @@ def format_findings(result):
     return "\n".join(lines)
 
 
+def format_recommendations(result):
+    """Format recommendations as a readable bulleted string."""
+    recs = generate_recommendations(result)
+    if not recs:
+        return "No recommendations - no issues detected."
+    return "\n".join(f"  - {r}" for r in recs)
+
+
+def write_csv(output_path, results):
+    """Write results to a CSV file with a recommendations column."""
+    with open(output_path, "w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.writer(csvfile, quoting=csv.QUOTE_ALL)
+        writer.writerow([
+            "URL",
+            "Has Issues",
+            "Critical",
+            "High",
+            "Medium",
+            "Low",
+            "Results",
+            "Recommendations",
+        ])
+
+        for result in sorted(results, key=lambda x: x["url"]):
+            formatted = format_findings(result)
+            recs = generate_recommendations(result)
+            recs_text = "\n".join(f"- {r}" for r in recs) if recs else ""
+            critical, high, medium, low = count_severities(result)
+            writer.writerow([
+                result["url"],
+                "YES" if has_issues(result) else "NO",
+                critical,
+                high,
+                medium,
+                low,
+                formatted,
+                recs_text,
+            ])
+
+
+def write_txt(output_path, results):
+    """Write results to a human-readable plain text file."""
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("=" * 70 + "\n")
+        f.write("Web Security Scanner - Results\n")
+        f.write("=" * 70 + "\n\n")
+
+        for result in sorted(results, key=lambda x: x["url"]):
+            critical, high, medium, low = count_severities(result)
+            issues_flag = "YES" if has_issues(result) else "NO"
+
+            f.write("-" * 70 + "\n")
+            f.write(f"URL: {result['url']}\n")
+            f.write(f"Has Issues: {issues_flag}\n")
+            f.write(
+                f"Severity Counts: {critical} CRITICAL | {high} HIGH | "
+                f"{medium} MEDIUM | {low} LOW\n"
+            )
+            f.write("-" * 70 + "\n")
+            f.write(format_findings(result) + "\n\n")
+
+            f.write("--- Recommendations ---\n")
+            f.write(format_recommendations(result) + "\n\n")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Web Security Scanner - Security Headers & JS Library Vulnerabilities",
@@ -676,8 +830,9 @@ def main():
         epilog="""
 Examples:
   %(prog)s -i urls.txt -o results.csv
+  %(prog)s -i urls.txt -o results.txt --format txt        (human-readable plain text)
   %(prog)s -i urls.txt -o results.csv --timeout 20 --threads 5
-  %(prog)s -i urls.txt -o results.csv --retire    (use retire.js if installed)
+  %(prog)s -i urls.txt -o results.csv --retire            (use retire.js if installed)
 
 Input file format (urls.txt):
   https://example.com
@@ -689,7 +844,14 @@ Input file format (urls.txt):
         "-i", "--input", required=True, help="Input text file with URLs (one per line)"
     )
     parser.add_argument(
-        "-o", "--output", required=True, help="Output CSV file path"
+        "-o", "--output", required=True, help="Output file path"
+    )
+    parser.add_argument(
+        "-f",
+        "--format",
+        choices=["csv", "txt"],
+        default=None,
+        help="Output format: 'csv' or 'txt' (default: inferred from output file extension, falls back to csv)",
     )
     parser.add_argument(
         "--timeout", type=int, default=15, help="Request timeout in seconds (default: 15)"
@@ -779,23 +941,19 @@ Input file format (urls.txt):
                     }
                 )
 
-    # Write CSV
+    # Determine output format
+    output_format = args.format
+    if output_format is None:
+        ext = os.path.splitext(args.output)[1].lower().lstrip(".")
+        output_format = ext if ext in ("csv", "txt") else "csv"
+
     print("-" * 60)
-    print(f"[*] Writing results to {args.output}...")
+    print(f"[*] Writing results to {args.output} (format: {output_format})...")
 
-    with open(args.output, "w", newline="", encoding="utf-8") as csvfile:
-        writer = csv.writer(csvfile, quoting=csv.QUOTE_ALL)
-        writer.writerow(["URL", "Has Issues", "Results"])
-
-        for result in sorted(results, key=lambda x: x["url"]):
-            formatted = format_findings(result)
-            all_findings = result["header_findings"] + result["js_findings"]
-            has_issues = any(
-                tag in f
-                for f in all_findings
-                for tag in ["[CRITICAL]", "[HIGH]", "[MEDIUM]", "[LOW]"]
-            )
-            writer.writerow([result["url"], "YES" if has_issues else "NO", formatted])
+    if output_format == "txt":
+        write_txt(args.output, results)
+    else:
+        write_csv(args.output, results)
 
     print(f"[+] Done! Results saved to: {args.output}")
     print(f"[+] Total URLs scanned: {len(results)}")
