@@ -180,7 +180,7 @@ def get_session():
 # ─────────────────────────────────────────────
 # Security Header Checks
 # ─────────────────────────────────────────────
-def check_security_headers(url, response):
+def check_security_headers(url, response, skip_csp=False):
     """Analyze security headers and return findings."""
     findings = []
     headers = response.headers
@@ -188,6 +188,8 @@ def check_security_headers(url, response):
 
     # Check required/recommended security headers
     for header_name, config in SECURITY_HEADERS.items():
+        if skip_csp and header_name == "Content-Security-Policy":
+            continue
         value = headers.get(header_name)
 
         if value is None:
@@ -581,7 +583,7 @@ def _parse_version(version_str):
 # ─────────────────────────────────────────────
 # Main Scanner
 # ─────────────────────────────────────────────
-def scan_url(url, session, use_retire=False, timeout=15):
+def scan_url(url, session, use_retire=False, timeout=15, skip_csp=False):
     """Scan a single URL for security issues."""
     # Normalize URL
     if not url.startswith(("http://", "https://")):
@@ -604,7 +606,7 @@ def scan_url(url, session, use_retire=False, timeout=15):
         result["status"] = response.status_code
 
         # 1) Security Header Analysis
-        result["header_findings"] = check_security_headers(url, response)
+        result["header_findings"] = check_security_headers(url, response, skip_csp=skip_csp)
 
         # 2) JavaScript Library Vulnerability Analysis
         html_content = response.text
@@ -864,6 +866,11 @@ Input file format (urls.txt):
         action="store_true",
         help="Use retire.js for JS library scanning (must be installed: npm install -g retire)",
     )
+    parser.add_argument(
+        "--no-csp",
+        action="store_true",
+        help="Skip Content-Security-Policy header checks (CSP is often hard for developers to fix)",
+    )
 
     args = parser.parse_args()
 
@@ -906,7 +913,7 @@ Input file format (urls.txt):
 
     with ThreadPoolExecutor(max_workers=args.threads) as executor:
         future_to_url = {
-            executor.submit(scan_url, url, session, use_retire, args.timeout): url
+            executor.submit(scan_url, url, session, use_retire, args.timeout, args.no_csp): url
             for url in urls
         }
 
