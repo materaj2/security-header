@@ -15,8 +15,9 @@ This manual explains how to apply security header and secure cookie configuratio
 7. [Apache HTTP Server](#7-apache-http-server)
 8. [Nginx](#8-nginx)
 9. [Apache Tomcat](#9-apache-tomcat)
-10. [Verification](#10-verification)
-11. [Troubleshooting](#11-troubleshooting)
+10. [Microsoft IIS](#10-microsoft-iis)
+11. [Verification](#11-verification)
+12. [Troubleshooting](#12-troubleshooting)
 
 ---
 
@@ -542,7 +543,98 @@ sudo systemctl restart tomcat
 
 ---
 
-## 10. Verification
+## 10. Microsoft IIS
+
+**File:** `iis_security.config`
+
+### Prerequisites
+
+Install the IIS features and the URL Rewrite Module on the server:
+
+```powershell
+# Run in an elevated PowerShell prompt
+Install-WindowsFeature -Name Web-Server, Web-Http-Redirect, Web-Filtering, Web-Static-Content
+
+# Install URL Rewrite Module (required for the HTTPS redirect and outbound
+# Set-Cookie rewrite rule). Download from:
+# https://www.iis.net/downloads/microsoft/url-rewrite
+```
+
+### How to Use
+
+The file is a complete `web.config` template. Apply it at one of three scopes:
+
+**Option A: Per-site `web.config`**
+
+```powershell
+# Back up the existing web.config first
+Copy-Item C:\inetpub\wwwroot\web.config C:\inetpub\wwwroot\web.config.bak
+
+# Copy the example, then merge with any existing settings
+Copy-Item iis_security.config C:\inetpub\wwwroot\web.config
+```
+
+**Option B: Per-application `web.config`**
+
+Place the file at the application root (e.g., `C:\inetpub\wwwroot\myapp\web.config`). Settings here override the parent site's configuration.
+
+**Option C: Server-wide via `applicationHost.config`**
+
+For settings that apply to every site on the server (HSTS, request filtering, removed modules), edit `%windir%\System32\inetsrv\config\applicationHost.config` directly, or use the PowerShell snippets in **PART 2** of the example file.
+
+### Apply SCHANNEL TLS Hardening
+
+The file ships with PowerShell snippets in **PART 3** that disable SSL 2.0/3.0 and TLS 1.0/1.1, enable TLS 1.2/1.3, remove weak ciphers (RC4, DES, 3DES, NULL), and set a strong cipher suite order via Group Policy registry keys.
+
+```powershell
+# Run as Administrator. Reboot required after.
+# Copy the Set-SchannelProtocol function and the disable/enable calls
+# from PART 3 of iis_security.config and execute them.
+
+Restart-Computer -Force
+```
+
+Verify with:
+
+```powershell
+# Confirm protocols
+Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\'
+
+# Confirm cipher suite order
+(Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Cryptography\Configuration\SSL\00010002').Functions
+```
+
+### Restart IIS
+
+```powershell
+# Reload configuration without dropping connections
+iisreset /noforce
+
+# Or restart a single site
+Restart-WebSite -Name "Default Web Site"
+```
+
+### Key Settings to Customize
+
+- **CSP directives**: Modify the `Content-Security-Policy` value in `<customHeaders>` to match your application's allowed origins
+- **HSTS**: Use either the `Strict-Transport-Security` header **or** the native `<hsts>` element (IIS 10 1709+) - not both
+- **Outbound Set-Cookie rule**: The default rule appends `Secure; HttpOnly; SameSite=Strict` unconditionally. If your application already sets these flags, you'll see duplicates - remove the rule or refine the match pattern
+- **`requireSSL="true"` on `<httpCookies>`**: This breaks authentication if the site is reachable over HTTP. Remove it for HTTP-only development environments
+- **`maxAllowedContentLength`**: Default is 10 MB - increase for sites that accept larger uploads
+- **Custom error page paths**: Update `/error/400.html`, etc., to match your actual error page locations
+- **Forms authentication**: Update `loginUrl`, `name`, and timeout to match your app
+- **`machineKey`**: Generate explicit keys for any web farm or any site using forms auth / out-of-process session state
+
+### Common IIS Pitfalls
+
+- **`removeServerHeader="true"` is IIS 10+ only.** On older IIS, use a URL Rewrite outbound rule against `RESPONSE_Server`, or install the `URLScan` ISAPI filter.
+- **WebDAV is enabled by default** on many IIS installs and exposes verbs like `PROPFIND`, `MKCOL`. The example removes the `WebDAVModule` - leave it removed unless you specifically need WebDAV.
+- **`<customErrors>` (system.web) and `<httpErrors>` (system.webServer) are different.** ASP.NET errors go through `customErrors`; static-file and IIS-pipeline errors go through `httpErrors`. The example configures both.
+- **Outbound rewrite rules run on every response.** A misconfigured `Set-Cookie` rule can break login flows that depend on the cookie format - test with a non-production user first.
+
+---
+
+## 11. Verification
 
 After applying configurations, verify your security headers using the scanner:
 
@@ -626,7 +718,7 @@ Set-Cookie: session=...; Secure; HttpOnly; SameSite=Strict; Path=/
 
 ---
 
-## 11. Troubleshooting
+## 12. Troubleshooting
 
 ### Common Issues
 
@@ -634,6 +726,7 @@ Set-Cookie: session=...; Secure; HttpOnly; SameSite=Strict; Path=/
 - Apache: Verify `mod_headers` is enabled (`apachectl -M | grep headers`)
 - Nginx: Check that `add_header` is not overridden in a child `location` block
 - Tomcat: Ensure the filter is mapped to `/*` and the filter class is on the classpath
+- IIS: Verify the `web.config` parses (`%windir%\System32\inetsrv\appcmd list config`); a syntax error makes IIS serve a 500.19 with no headers at all
 
 **CSP blocking resources**
 - Use browser DevTools Console to identify blocked resources
@@ -660,6 +753,13 @@ Set-Cookie: session=...; Secure; HttpOnly; SameSite=Strict; Path=/
 **Next.js specific**
 - `unsafe-eval` is required in development mode; use nonce-based CSP in production
 - Static assets under `/_next/static/` should have different cache headers than HTML pages
+
+**IIS specific**
+- "HTTP Error 500.19 - Internal Server Error" usually means a web.config schema mismatch (e.g., `<rewrite>` without URL Rewrite Module installed, or `<hsts>` on IIS &lt; 10 1709). Install the missing module or remove the offending element.
+- "Server" header still appearing after `removeServerHeader="true"`: requires IIS 10+. On older versions, add an outbound URL Rewrite rule that clears `RESPONSE_Server`.
+- Cookies missing `Secure` despite `requireSSL="true"`: the site must be reached over HTTPS - over plain HTTP, ASP.NET will not emit the cookie at all.
+- WebDAV verbs (`PROPFIND`, `MKCOL`) returning 405 unexpectedly: confirm `<modules><remove name="WebDAVModule" /></modules>` is in effect; otherwise the WebDAV module hijacks these verbs even when you don't use it.
+- SCHANNEL changes appear to do nothing: SCHANNEL caches protocol/cipher state until reboot. After registry changes, run `Restart-Computer -Force`.
 
 **TLS/HTTPS issues**
 - Certificate chain errors: Use `fullchain.pem` (not just `cert.pem`) in your server config
