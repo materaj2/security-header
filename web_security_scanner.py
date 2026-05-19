@@ -581,6 +581,238 @@ def _parse_version(version_str):
 
 
 # ─────────────────────────────────────────────
+# CSP Auto-Generation
+# ─────────────────────────────────────────────
+CSP_DIRECTIVE_ORDER = [
+    "default-src",
+    "script-src",
+    "style-src",
+    "img-src",
+    "font-src",
+    "connect-src",
+    "frame-src",
+    "media-src",
+    "object-src",
+    "form-action",
+    "base-uri",
+    "frame-ancestors",
+]
+
+FONT_EXT_RE = re.compile(r"\.(woff2?|ttf|otf|eot)(\?|$)", re.IGNORECASE)
+
+
+def _csp_resolve_source(raw_src, base_origin, base_scheme):
+    """Convert a raw URL/path from page content into a CSP source token."""
+    if not raw_src:
+        return None
+    s = raw_src.strip()
+    if not s or s.startswith(("javascript:", "mailto:", "tel:", "#")):
+        return None
+    if s.startswith("data:"):
+        return "data:"
+    if s.startswith("blob:"):
+        return "blob:"
+    if s.startswith("//"):
+        s = base_scheme + ":" + s
+    if s.startswith(("http://", "https://", "ws://", "wss://")):
+        try:
+            p = urlparse(s)
+            if not p.netloc:
+                return "'self'"
+            origin = f"{p.scheme}://{p.netloc}"
+            return "'self'" if origin == base_origin else origin
+        except Exception:
+            return None
+    # Relative / root-relative paths
+    return "'self'"
+
+
+def _csp_sort_key(token):
+    """Sort CSP source tokens: keywords first, then origins alphabetically."""
+    keyword_order = [
+        "'none'",
+        "'self'",
+        "'unsafe-inline'",
+        "'unsafe-eval'",
+        "'strict-dynamic'",
+        "data:",
+        "blob:",
+    ]
+    try:
+        return (0, keyword_order.index(token))
+    except ValueError:
+        return (1, token.lower())
+
+
+def generate_csp_from_page(url, html_content):
+    """
+    Analyze the HTML content of a page and return a tailored Content-Security-Policy
+    recommendation along with notes about insecure patterns detected.
+
+    Returns: (csp_string, notes_list) or (None, []) if analysis fails.
+    """
+    try:
+        soup = BeautifulSoup(html_content, "html.parser")
+    except Exception:
+        return None, []
+
+    parsed = urlparse(url)
+    base_origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.netloc else ""
+    base_scheme = parsed.scheme or "https"
+
+    directives = {d: set() for d in CSP_DIRECTIVE_ORDER}
+    directives["default-src"].add("'self'")
+    directives["object-src"].add("'none'")
+    directives["base-uri"].add("'self'")
+    directives["frame-ancestors"].add("'self'")
+    # 'self' is a safe baseline for the standard resource directives — the page may
+    # load same-origin assets the static scan didn't observe.
+    for d in ("script-src", "style-src", "img-src", "font-src", "connect-src", "form-action"):
+        directives[d].add("'self'")
+
+    notes = set()
+
+    def add(directive, raw_src):
+        token = _csp_resolve_source(raw_src, base_origin, base_scheme)
+        if token:
+            directives[directive].add(token)
+
+    # Scripts (external + inline)
+    for tag in soup.find_all("script"):
+        src = tag.get("src")
+        if src:
+            add("script-src", src)
+        else:
+            body = (tag.string or "").strip()
+            if body:
+                directives["script-src"].add("'unsafe-inline'")
+                notes.add(
+                    "Inline <script> blocks detected — prefer nonces or hashes over 'unsafe-inline'."
+                )
+                if re.search(r"\beval\s*\(|new\s+Function\s*\(", body):
+                    directives["script-src"].add("'unsafe-eval'")
+                    notes.add(
+                        "eval() or new Function() usage detected — required 'unsafe-eval'; refactor to avoid it."
+                    )
+                # Detect fetch/XHR/WebSocket targets for connect-src
+                for u in re.findall(
+                    r"""(?:fetch|\.open|new\s+WebSocket|new\s+EventSource)\s*\(\s*['"]([^'"]+)['"]""",
+                    body,
+                ):
+                    add("connect-src", u)
+                for u in re.findall(r"""['"](wss?://[^'"\s]+)['"]""", body):
+                    add("connect-src", u)
+
+    # Stylesheets (external <link>)
+    for tag in soup.find_all("link"):
+        rel = tag.get("rel") or []
+        if isinstance(rel, str):
+            rel = [rel]
+        rel_lower = [r.lower() for r in rel]
+        href = tag.get("href")
+        if not href:
+            continue
+        if "stylesheet" in rel_lower:
+            add("style-src", href)
+            if FONT_EXT_RE.search(href):
+                add("font-src", href)
+        if "preload" in rel_lower:
+            as_attr = (tag.get("as") or "").lower()
+            mapping = {
+                "script": "script-src",
+                "style": "style-src",
+                "image": "img-src",
+                "font": "font-src",
+                "fetch": "connect-src",
+                "audio": "media-src",
+                "video": "media-src",
+                "track": "media-src",
+            }
+            if as_attr in mapping:
+                add(mapping[as_attr], href)
+        if "preconnect" in rel_lower or "dns-prefetch" in rel_lower:
+            host_lower = href.lower()
+            if "font" in host_lower or "gstatic" in host_lower:
+                add("font-src", href)
+                add("style-src", href)
+
+    # Inline <style> blocks + style="" attributes
+    for tag in soup.find_all("style"):
+        body = tag.string or ""
+        if body.strip():
+            directives["style-src"].add("'unsafe-inline'")
+            notes.add(
+                "Inline <style> blocks detected — prefer nonces or hashes over 'unsafe-inline'."
+            )
+        for font_url in re.findall(
+            r"url\(\s*['\"]?([^)'\"]+)['\"]?\s*\)", body, re.IGNORECASE
+        ):
+            if FONT_EXT_RE.search(font_url):
+                add("font-src", font_url)
+            elif font_url.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp")):
+                add("img-src", font_url)
+    if soup.find(attrs={"style": True}):
+        directives["style-src"].add("'unsafe-inline'")
+        notes.add(
+            "Inline style attributes detected — prefer nonces or hashes over 'unsafe-inline'."
+        )
+
+    # Images / media / frames / forms
+    for tag in soup.find_all("img"):
+        add("img-src", tag.get("src"))
+        srcset = tag.get("srcset") or ""
+        for part in srcset.split(","):
+            candidate = part.strip().split(" ")[0]
+            add("img-src", candidate)
+    for tag in soup.find_all(["picture", "source"]):
+        srcset = tag.get("srcset") or ""
+        for part in srcset.split(","):
+            candidate = part.strip().split(" ")[0]
+            if candidate:
+                add("img-src", candidate)
+    for tag in soup.find_all(["iframe", "frame"]):
+        add("frame-src", tag.get("src"))
+    for tag in soup.find_all(["video", "audio"]):
+        add("media-src", tag.get("src"))
+        for source in tag.find_all("source"):
+            add("media-src", source.get("src"))
+    for tag in soup.find_all("form"):
+        add("form-action", tag.get("action"))
+    for tag in soup.find_all(["object", "embed"]):
+        src = tag.get("data") or tag.get("src")
+        if src:
+            directives["object-src"].discard("'none'")
+            add("object-src", src)
+
+    # Inline event handlers force 'unsafe-inline' for scripts
+    for tag in soup.find_all(True):
+        for attr in list(tag.attrs.keys()):
+            if attr.lower().startswith("on") and attr.lower() not in ("once",):
+                directives["script-src"].add("'unsafe-inline'")
+                notes.add(
+                    "Inline event handlers (onclick, onload, etc.) detected — "
+                    "these require 'unsafe-inline' for scripts; migrate to addEventListener."
+                )
+                break
+
+    # Backfill empty directives with sensible defaults
+    for d in ("script-src", "style-src", "img-src", "font-src", "connect-src"):
+        if not directives[d]:
+            directives[d].add("'self'")
+
+    # Build the CSP string in canonical order, omitting any directive with no sources
+    parts = []
+    for d in CSP_DIRECTIVE_ORDER:
+        sources = directives.get(d)
+        if not sources:
+            continue
+        token_list = sorted(sources, key=_csp_sort_key)
+        parts.append(f"{d} {' '.join(token_list)}")
+
+    return "; ".join(parts), sorted(notes)
+
+
+# ─────────────────────────────────────────────
 # Main Scanner
 # ─────────────────────────────────────────────
 def scan_url(url, session, use_retire=False, timeout=15, skip_csp=False):
@@ -589,7 +821,14 @@ def scan_url(url, session, use_retire=False, timeout=15, skip_csp=False):
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
 
-    result = {"url": url, "status": None, "header_findings": [], "js_findings": []}
+    result = {
+        "url": url,
+        "status": None,
+        "header_findings": [],
+        "js_findings": [],
+        "csp_suggestion": None,
+        "csp_notes": [],
+    }
 
     try:
         response = session.get(
@@ -620,6 +859,28 @@ def scan_url(url, session, use_retire=False, timeout=15, skip_csp=False):
             if f not in existing:
                 result["js_findings"].append(f)
 
+        # 3) Auto-generate a tailored CSP recommendation when CSP is missing or misconfigured
+        if not skip_csp:
+            csp_present = response.headers.get("Content-Security-Policy")
+            csp_needs_help = (
+                csp_present is None
+                or any(
+                    "Content-Security-Policy: MISSING" in f
+                    or "Content-Security-Policy: MISCONFIGURED" in f
+                    for f in result["header_findings"]
+                )
+            )
+            if csp_needs_help and html_content:
+                csp_suggestion, csp_notes = generate_csp_from_page(url, html_content)
+                if csp_suggestion:
+                    result["csp_suggestion"] = csp_suggestion
+                    result["csp_notes"] = csp_notes
+                    result["header_findings"].append(
+                        f"[INFO] Content-Security-Policy: Auto-generated suggestion based on page content: {csp_suggestion}"
+                    )
+                    for note in csp_notes:
+                        result["header_findings"].append(f"[INFO] CSP note: {note}")
+
     except requests.exceptions.SSLError as e:
         result["status"] = "SSL_ERROR"
         result["header_findings"] = [f"[CRITICAL] SSL/TLS Error: {str(e)[:200]}"]
@@ -640,6 +901,8 @@ def generate_recommendations(result):
     """Build remediation recommendations from a result's findings."""
     recs = []
 
+    csp_suggestion = result.get("csp_suggestion")
+
     for f in result["header_findings"]:
         # Missing security header
         m = re.match(r"\[(?:HIGH|MEDIUM)\] ([^:]+): MISSING", f)
@@ -647,7 +910,14 @@ def generate_recommendations(result):
             header = m.group(1).strip()
             cfg = SECURITY_HEADERS.get(header)
             if cfg:
-                recs.append(f"Add '{header}' header. Recommended: {cfg['recommended']}")
+                if header == "Content-Security-Policy" and csp_suggestion:
+                    recs.append(
+                        f"Add 'Content-Security-Policy' header. Auto-generated for this page: {csp_suggestion}"
+                    )
+                else:
+                    recs.append(
+                        f"Add '{header}' header. Recommended: {cfg['recommended']}"
+                    )
             continue
 
         # Misconfigured security header
@@ -656,9 +926,14 @@ def generate_recommendations(result):
             header = m.group(1).strip()
             cfg = SECURITY_HEADERS.get(header)
             if cfg:
-                recs.append(
-                    f"Fix '{header}' configuration. Recommended: {cfg['recommended']}"
-                )
+                if header == "Content-Security-Policy" and csp_suggestion:
+                    recs.append(
+                        f"Fix 'Content-Security-Policy' configuration. Auto-generated for this page: {csp_suggestion}"
+                    )
+                else:
+                    recs.append(
+                        f"Fix '{header}' configuration. Recommended: {cfg['recommended']}"
+                    )
             continue
 
         # Information leakage headers
@@ -708,6 +983,173 @@ def generate_recommendations(result):
             seen.add(r)
             unique.append(r)
     return unique
+
+
+# Concrete example values used when rendering server config snippets.
+# These are stricter/cleaner picks than the loose "Recommended:" strings shown
+# in finding lines (e.g. "DENY or SAMEORIGIN" → "DENY").
+HEADER_EXAMPLE_VALUES = {
+    "Strict-Transport-Security": "max-age=31536000; includeSubDomains; preload",
+    "Content-Security-Policy": "default-src 'self'; script-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'self'",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "Permissions-Policy": "geolocation=(), camera=(), microphone=()",
+    "X-XSS-Protection": "0",
+    "Cross-Origin-Opener-Policy": "same-origin",
+    "Cross-Origin-Resource-Policy": "same-origin",
+    "Cross-Origin-Embedder-Policy": "require-corp",
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+}
+
+
+def _collect_header_actions(result):
+    """
+    Walk findings and produce structured lists of changes for config-snippet rendering.
+
+    Returns:
+        headers_to_set:    list of (header_name, value) pairs in finding order
+        headers_to_remove: list of header names to strip (information leakage)
+        flags: dict of bool flags — 'cookies', 'https_redirect', 'tls_error'
+    """
+    headers_to_set = []
+    headers_to_remove = []
+    seen_set = set()
+    seen_remove = set()
+    flags = {"cookies": False, "https_redirect": False, "tls_error": False}
+
+    csp_suggestion = result.get("csp_suggestion")
+
+    for f in result["header_findings"]:
+        m = re.match(r"\[(?:HIGH|MEDIUM)\] ([^:]+): (MISSING|MISCONFIGURED)", f)
+        if m:
+            header = m.group(1).strip()
+            if header in seen_set or header not in SECURITY_HEADERS:
+                continue
+            if header == "Content-Security-Policy" and csp_suggestion:
+                value = csp_suggestion
+            else:
+                value = HEADER_EXAMPLE_VALUES.get(
+                    header, SECURITY_HEADERS[header]["recommended"]
+                )
+            seen_set.add(header)
+            headers_to_set.append((header, value))
+            continue
+
+        m = re.match(r"\[LOW\] ([^:]+): PRESENT", f)
+        if m:
+            header = m.group(1).strip()
+            if header in seen_remove:
+                continue
+            seen_remove.add(header)
+            headers_to_remove.append(header)
+            continue
+
+        if "[HIGH] HTTPS:" in f:
+            flags["https_redirect"] = True
+            continue
+        if "[MEDIUM] Set-Cookie:" in f:
+            flags["cookies"] = True
+            continue
+        if "[CRITICAL] SSL/TLS Error" in f:
+            flags["tls_error"] = True
+            continue
+
+    return headers_to_set, headers_to_remove, flags
+
+
+def build_apache_config(result):
+    """Render an Apache mod_headers snippet for this result, or '' if nothing to do."""
+    headers_to_set, headers_to_remove, flags = _collect_header_actions(result)
+    if not (headers_to_set or headers_to_remove or any(flags.values())):
+        return ""
+
+    lines = []
+    lines.append("# Apache — requires mod_headers (a2enmod headers).")
+    lines.append("# Place in httpd.conf, the virtual host, or a .htaccess file.")
+    lines.append("<IfModule mod_headers.c>")
+    for h, v in headers_to_set:
+        # Escape any embedded double quotes in the value
+        safe_v = v.replace('"', '\\"')
+        lines.append(f'    Header always set {h} "{safe_v}"')
+    for h in headers_to_remove:
+        lines.append(f"    Header always unset {h}")
+    lines.append("</IfModule>")
+
+    if flags["cookies"]:
+        lines.append("")
+        lines.append("# Cookie hardening — prefer setting these in your app. Apache fallback:")
+        lines.append(
+            '# Header edit Set-Cookie ^(.*)$ "$1; Secure; HttpOnly; SameSite=Strict"'
+        )
+    if flags["https_redirect"]:
+        lines.append("")
+        lines.append("# Force HTTP → HTTPS (requires mod_rewrite):")
+        lines.append("# <IfModule mod_rewrite.c>")
+        lines.append("#     RewriteEngine On")
+        lines.append("#     RewriteCond %{HTTPS} off")
+        lines.append("#     RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [L,R=301]")
+        lines.append("# </IfModule>")
+    if flags["tls_error"]:
+        lines.append("")
+        lines.append("# TLS errors detected — review SSLCertificateFile / SSLProtocol / SSLCipherSuite.")
+
+    return "\n".join(lines)
+
+
+def build_nginx_config(result):
+    """Render an nginx snippet for this result, or '' if nothing to do."""
+    headers_to_set, headers_to_remove, flags = _collect_header_actions(result)
+    if not (headers_to_set or headers_to_remove or any(flags.values())):
+        return ""
+
+    lines = []
+    lines.append("# Nginx — place inside the relevant server {} block,")
+    lines.append("# or include via /etc/nginx/conf.d/security-headers.conf.")
+    for h, v in headers_to_set:
+        safe_v = v.replace('"', '\\"')
+        lines.append(f'add_header {h} "{safe_v}" always;')
+
+    if "Server" in headers_to_remove:
+        lines.append("server_tokens off;  # hides nginx version from the Server header")
+    other_removes = [h for h in headers_to_remove if h != "Server"]
+    if other_removes:
+        lines.append("# Stripping the headers below requires the ngx_headers_more module:")
+        for h in other_removes:
+            lines.append(f'# more_clear_headers "{h}";')
+
+    if flags["cookies"]:
+        lines.append("")
+        lines.append("# Cookie hardening — prefer setting these in your app. Nginx fallback (1.19.3+):")
+        lines.append("# proxy_cookie_flags ~ secure httponly samesite=strict;")
+    if flags["https_redirect"]:
+        lines.append("")
+        lines.append("# Force HTTP → HTTPS (separate server block):")
+        lines.append("# server {")
+        lines.append("#     listen 80;")
+        lines.append("#     listen [::]:80;")
+        lines.append("#     server_name _;")
+        lines.append("#     return 301 https://$host$request_uri;")
+        lines.append("# }")
+    if flags["tls_error"]:
+        lines.append("")
+        lines.append("# TLS errors detected — review ssl_certificate / ssl_protocols / ssl_ciphers.")
+
+    return "\n".join(lines)
+
+
+def format_config_examples(result):
+    """Combined Apache + Nginx snippet block for plain-text output."""
+    apache = build_apache_config(result)
+    nginx = build_nginx_config(result)
+    if not apache and not nginx:
+        return ""
+    sections = []
+    if apache:
+        sections.append("[Apache]\n" + apache)
+    if nginx:
+        sections.append("[Nginx]\n" + nginx)
+    return "\n\n".join(sections)
 
 
 def count_severities(result):
@@ -781,6 +1223,8 @@ def write_csv(output_path, results):
             "Low",
             "Results",
             "Recommendations",
+            "Apache Config",
+            "Nginx Config",
         ])
 
         for result in sorted(results, key=lambda x: x["url"]):
@@ -797,6 +1241,8 @@ def write_csv(output_path, results):
                 low,
                 formatted,
                 recs_text,
+                build_apache_config(result),
+                build_nginx_config(result),
             ])
 
 
@@ -823,6 +1269,11 @@ def write_txt(output_path, results):
 
             f.write("--- Recommendations ---\n")
             f.write(format_recommendations(result) + "\n\n")
+
+            example_cfg = format_config_examples(result)
+            if example_cfg:
+                f.write("--- Example Server Configurations ---\n")
+                f.write(example_cfg + "\n\n")
 
 
 def main():
@@ -945,6 +1396,8 @@ Input file format (urls.txt):
                         "status": "SCAN_ERROR",
                         "header_findings": [f"[ERROR] {str(e)}"],
                         "js_findings": [],
+                        "csp_suggestion": None,
+                        "csp_notes": [],
                     }
                 )
 
