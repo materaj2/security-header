@@ -1,2 +1,0 @@
-atts.truecorp.co.th:443
-atts-api4proms.truecorp.co.th:443
