@@ -1,0 +1,107 @@
+"URL","Has Issues","Critical","High","Medium","Low","Results","Recommendations","Generated CSP (Strict)","Generated CSP (Hash-based)","Generated CSP (Practical)","CSP Warnings","Apache Config","Nginx Config","Nginx Nonce Template"
+"https://example.com","YES","0","6","5","1","=== HTTP Status: 200 ===
+
+--- Security Headers ---
+  [HIGH] Strict-Transport-Security: MISSING - HSTS - Forces HTTPS connections. Recommended: max-age=31536000; includeSubDomains; preload
+  [HIGH] Content-Security-Policy: MISSING - CSP - Mitigates XSS and injection attacks. Recommended: default-src 'self'; script-src 'self'; object-src 'none'
+  [HIGH] X-Content-Type-Options: MISSING - Prevents MIME-type sniffing. Recommended: nosniff
+  [HIGH] X-Frame-Options: MISSING - Prevents clickjacking via framing. Recommended: DENY or SAMEORIGIN
+  [HIGH] Referrer-Policy: MISSING - Controls referrer information sent with requests. Recommended: strict-origin-when-cross-origin or no-referrer
+  [HIGH] Permissions-Policy: MISSING - Controls browser feature access (camera, mic, geolocation, etc.). Recommended: geolocation=(), camera=(), microphone=()
+  [MEDIUM] X-XSS-Protection: MISSING - Legacy XSS filter (deprecated, but absence noted). Recommended: 0 (disable) or absent with strong CSP
+  [MEDIUM] Cross-Origin-Opener-Policy: MISSING - COOP - Isolates browsing context. Recommended: same-origin
+  [MEDIUM] Cross-Origin-Resource-Policy: MISSING - CORP - Controls cross-origin resource loading. Recommended: same-origin or same-site
+  [MEDIUM] Cross-Origin-Embedder-Policy: MISSING - COEP - Controls cross-origin embedding. Recommended: require-corp
+  [MEDIUM] Cache-Control: MISSING - Controls caching behavior. Recommended: no-store, no-cache for sensitive pages
+  [LOW] Server: PRESENT ('cloudflare') - Reveals web server software/version. Consider removing or obfuscating.
+  [INFO] Content-Security-Policy (Strict, recommended): default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; form-action 'self'; base-uri 'self'; frame-ancestors 'none'; upgrade-insecure-requests
+  [INFO] Content-Security-Policy (Hash-based, Bitsight-friendly): default-src 'self'; script-src 'self'; style-src 'self' 'sha256-bPz1p+hPRvUB6/coXO5smlJ00u0kwHOGz+NGVcCSKeM='; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; form-action 'self'; base-uri 'self'; frame-ancestors 'none'; upgrade-insecure-requests
+  [INFO] Content-Security-Policy (Practical, works without refactoring): default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; form-action 'self'; base-uri 'self'; frame-ancestors 'none'; upgrade-insecure-requests
+  [INFO] CSP note: A practical CSP companion was emitted with 'unsafe-inline' (and 'unsafe-eval' if needed). Works immediately but penalised by security-ratings services (Bitsight, SecurityScorecard). Prefer the hash-based variant or the strict variant after refactoring.
+  [INFO] CSP note: Hash-based CSP variant emitted with 0 script hash(es) and 1 style hash(es). Bitsight-friendly. Hashes are stable per page version — update the CSP when the page is redeployed.
+  [INFO] CSP note: Hash-based CSP was generated from the static HTML response only. If the page injects styles/scripts at runtime (e.g. React style-loader), re-run with --deep to capture them.
+  [INFO] CSP note: Inline <style> blocks or style="""" attributes detected — policy will block them. Fix by moving CSS into external files, or add a nonce to style-src and the <style> tags.
+
+--- JavaScript Libraries ---
+  No JS libraries detected / No findings.
+
+--- Summary: 0 CRITICAL | 6 HIGH | 5 MEDIUM | 1 LOW ---","- Add 'Strict-Transport-Security' header. Recommended: max-age=31536000; includeSubDomains; preload
+- Add 'Content-Security-Policy' header. Auto-generated for this page: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; form-action 'self'; base-uri 'self'; frame-ancestors 'none'; upgrade-insecure-requests
+- Add 'X-Content-Type-Options' header. Recommended: nosniff
+- Add 'X-Frame-Options' header. Recommended: DENY or SAMEORIGIN
+- Add 'Referrer-Policy' header. Recommended: strict-origin-when-cross-origin or no-referrer
+- Add 'Permissions-Policy' header. Recommended: geolocation=(), camera=(), microphone=()
+- Add 'X-XSS-Protection' header. Recommended: 0 (disable) or absent with strong CSP
+- Add 'Cross-Origin-Opener-Policy' header. Recommended: same-origin
+- Add 'Cross-Origin-Resource-Policy' header. Recommended: same-origin or same-site
+- Add 'Cross-Origin-Embedder-Policy' header. Recommended: require-corp
+- Add 'Cache-Control' header. Recommended: no-store, no-cache for sensitive pages
+- Remove or obfuscate 'Server' header to avoid leaking server info.","default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; form-action 'self'; base-uri 'self'; frame-ancestors 'none'; upgrade-insecure-requests","default-src 'self'; script-src 'self'; style-src 'self' 'sha256-bPz1p+hPRvUB6/coXO5smlJ00u0kwHOGz+NGVcCSKeM='; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; form-action 'self'; base-uri 'self'; frame-ancestors 'none'; upgrade-insecure-requests","default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; form-action 'self'; base-uri 'self'; frame-ancestors 'none'; upgrade-insecure-requests","- A practical CSP companion was emitted with 'unsafe-inline' (and 'unsafe-eval' if needed). Works immediately but penalised by security-ratings services (Bitsight, SecurityScorecard). Prefer the hash-based variant or the strict variant after refactoring.
+- Hash-based CSP variant emitted with 0 script hash(es) and 1 style hash(es). Bitsight-friendly. Hashes are stable per page version — update the CSP when the page is redeployed.
+- Hash-based CSP was generated from the static HTML response only. If the page injects styles/scripts at runtime (e.g. React style-loader), re-run with --deep to capture them.
+- Inline <style> blocks or style="""" attributes detected — policy will block them. Fix by moving CSS into external files, or add a nonce to style-src and the <style> tags.","# Apache — requires mod_headers (a2enmod headers).
+# Place in httpd.conf, the virtual host, or a .htaccess file.
+<IfModule mod_headers.c>
+    Header always set Strict-Transport-Security ""max-age=31536000; includeSubDomains; preload""
+    Header always set Content-Security-Policy ""default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; form-action 'self'; base-uri 'self'; frame-ancestors 'none'; upgrade-insecure-requests""
+    Header always set X-Content-Type-Options ""nosniff""
+    Header always set X-Frame-Options ""DENY""
+    Header always set Referrer-Policy ""strict-origin-when-cross-origin""
+    Header always set Permissions-Policy ""geolocation=(), camera=(), microphone=()""
+    Header always set X-XSS-Protection ""0""
+    Header always set Cross-Origin-Opener-Policy ""same-origin""
+    Header always set Cross-Origin-Resource-Policy ""same-origin""
+    Header always set Cross-Origin-Embedder-Policy ""require-corp""
+    Header always set Cache-Control ""no-store, no-cache, must-revalidate, max-age=0""
+    Header always unset Server
+</IfModule>","# Nginx — place inside the relevant server {} block,
+# or include via /etc/nginx/conf.d/security-headers.conf.
+add_header Strict-Transport-Security ""max-age=31536000; includeSubDomains; preload"" always;
+add_header Content-Security-Policy ""default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; form-action 'self'; base-uri 'self'; frame-ancestors 'none'; upgrade-insecure-requests"" always;
+add_header X-Content-Type-Options ""nosniff"" always;
+add_header X-Frame-Options ""DENY"" always;
+add_header Referrer-Policy ""strict-origin-when-cross-origin"" always;
+add_header Permissions-Policy ""geolocation=(), camera=(), microphone=()"" always;
+add_header X-XSS-Protection ""0"" always;
+add_header Cross-Origin-Opener-Policy ""same-origin"" always;
+add_header Cross-Origin-Resource-Policy ""same-origin"" always;
+add_header Cross-Origin-Embedder-Policy ""require-corp"" always;
+add_header Cache-Control ""no-store, no-cache, must-revalidate, max-age=0"" always;
+server_tokens off;  # hides nginx version from the Server header","# Nginx + per-request CSP nonce — Bitsight/SecurityScorecard-friendly
+# alternative to 'unsafe-inline'. Generated for: https://example.com
+#
+# Requirements (one of):
+#   - nginx-extras package (apt install nginx-extras) for set_secure_random_alphanum
+#   - OR OpenResty / nginx + lua-nginx-module
+#
+# Place inside the relevant 'location' or 'server' block.
+
+# 1. Fresh 32-char nonce for every request.
+set_secure_random_alphanum $cspNonce 32;
+
+# 2. Disable upstream compression so sub_filter can rewrite the response body.
+proxy_set_header Accept-Encoding """";
+
+# 3. Inject nonce into every <script> and <style> tag.
+sub_filter_once off;
+sub_filter_types text/html;
+sub_filter '<script'  '<script nonce=""$cspNonce""';
+sub_filter '<style'   '<style nonce=""$cspNonce""';
+
+# 4. CSP using 'nonce-...' + 'strict-dynamic'. The nonce-allowed root script
+#    can then load other scripts transitively without origin allowlisting.
+add_header Content-Security-Policy ""\
+default-src 'self'; \
+script-src 'nonce-$cspNonce' 'strict-dynamic'; \
+style-src 'nonce-$cspNonce'; \
+img-src 'self' data: blob: data:; \
+font-src 'self' data:; \
+connect-src 'self'; \
+object-src 'none'; base-uri 'self'; frame-ancestors 'self'; \
+upgrade-insecure-requests; block-all-mixed-content; \
+require-trusted-types-for 'script'\
+"" always;
+
+# Keep Referrer-Policy on its OWN header — it is NOT a CSP directive.
+add_header Referrer-Policy ""strict-origin-when-cross-origin"" always;
+"

@@ -1,0 +1,7 @@
+# Deep-mode dependencies — required for: --deep flag (headless browser scan)
+# Install with:
+#   pip install -r requirements-deep.txt
+#   playwright install chromium
+# (Automatically pulls in core requirements.txt too.)
+-r requirements.txt
+playwright>=1.40.0

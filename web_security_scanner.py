@@ -15,15 +15,19 @@ Author: Security Lab Tool
 """
 
 import argparse
+import base64
 import csv
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date
 from urllib.parse import urlparse
 
 try:
@@ -39,6 +43,37 @@ try:
 except ImportError:
     print("[!] 'beautifulsoup4' not installed. Run: pip install beautifulsoup4")
     sys.exit(1)
+
+# ─────────────────────────────────────────────
+# CSP directive vocabulary (used both for validation and source classification)
+# ─────────────────────────────────────────────
+VALID_CSP_DIRECTIVES = {
+    # Fetch directives
+    "child-src", "connect-src", "default-src", "font-src", "frame-src",
+    "img-src", "manifest-src", "media-src", "object-src", "prefetch-src",
+    "script-src", "script-src-elem", "script-src-attr",
+    "style-src", "style-src-elem", "style-src-attr", "worker-src",
+    # Document directives
+    "base-uri", "sandbox",
+    # Navigation directives
+    "form-action", "frame-ancestors", "navigate-to",
+    # Reporting directives
+    "report-uri", "report-to",
+    # Other / boolean directives
+    "block-all-mixed-content", "upgrade-insecure-requests",
+    "require-trusted-types-for", "trusted-types",
+    "require-sri-for", "plugin-types", "referrer",
+}
+
+# Values that legitimately belong to Referrer-Policy, NOT CSP.
+# When one of these appears as a CSP directive name, it's almost always a
+# header confusion bug — flag it explicitly so the user gets a clear hint.
+REFERRER_POLICY_VALUES = {
+    "no-referrer", "no-referrer-when-downgrade", "origin",
+    "origin-when-cross-origin", "same-origin", "strict-origin",
+    "strict-origin-when-cross-origin", "unsafe-url",
+}
+
 
 # ─────────────────────────────────────────────
 # Configuration
@@ -161,6 +196,41 @@ UNWANTED_HEADERS = {
 }
 
 
+def _validate_csp_directive_names(csp_value):
+    """
+    Walk a CSP header value and return a list of (severity, message) findings
+    for directive names that aren't part of the CSP spec. Catches the very
+    common mistake of putting Referrer-Policy values (e.g.
+    'strict-origin-when-cross-origin') into the CSP header — when that happens,
+    the browser silently ignores the directive and the policy is effectively
+    just whatever else is present.
+    """
+    findings = []
+    for raw in csp_value.split(";"):
+        token = raw.strip()
+        if not token:
+            continue
+        directive = token.split()[0].lower()
+        if directive in VALID_CSP_DIRECTIVES:
+            continue
+        if directive in REFERRER_POLICY_VALUES:
+            findings.append((
+                "HIGH",
+                f"Invalid CSP directive '{directive}' — this is a Referrer-Policy value, "
+                f"not a CSP directive. The browser silently ignores it, so any sources you "
+                f"intended to allow here are NOT actually whitelisted. Move "
+                f"'{directive}' to a separate 'Referrer-Policy' header and use the correct "
+                f"CSP directive (e.g. 'script-src') for the origins it was meant to allow.",
+            ))
+        else:
+            findings.append((
+                "MEDIUM",
+                f"Unknown CSP directive '{directive}' — browsers ignore it. "
+                f"Check spelling against the CSP spec.",
+            ))
+    return findings
+
+
 def _extract_max_age(value):
     """Extract max-age value from HSTS header."""
     match = re.search(r"max-age=(\d+)", value, re.IGNORECASE)
@@ -221,6 +291,12 @@ def check_security_headers(url, response, skip_csp=False):
                 )
             else:
                 findings.append(f"[OK] {header_name}: {value}")
+
+            # Extra validation for CSP — catch unknown / mistyped directive names
+            # (e.g. Referrer-Policy values accidentally placed in the CSP header).
+            if header_name == "Content-Security-Policy":
+                for severity, msg in _validate_csp_directive_names(value):
+                    findings.append(f"[{severity}] {header_name}: {msg}")
 
     # Check for information leakage headers
     for header_name, description in UNWANTED_HEADERS.items():
@@ -644,32 +720,63 @@ def _csp_sort_key(token):
         return (1, token.lower())
 
 
-def generate_csp_from_page(url, html_content):
+def _csp_sha256(content):
     """
-    Analyze the HTML content of a page and return a tailored Content-Security-Policy
-    recommendation along with notes about insecure patterns detected.
+    Return the CSP source-list hash token for an inline script/style block.
+    Format: 'sha256-BASE64='. Browsers compute the hash over the exact bytes of
+    the element's text content (no whitespace normalisation), so we pass the
+    string as-is.
+    """
+    digest = hashlib.sha256(content.encode("utf-8")).digest()
+    return f"'sha256-{base64.b64encode(digest).decode('ascii')}'"
 
-    Returns: (csp_string, notes_list) or (None, []) if analysis fails.
+
+def _empty_directives():
+    """Return a fresh directive→set-of-tokens dict with strict baseline tokens."""
+    directives = {d: set() for d in CSP_DIRECTIVE_ORDER}
+    directives["default-src"].add("'self'")
+    directives["object-src"].add("'none'")
+    directives["base-uri"].add("'self'")
+    directives["frame-ancestors"].add("'none'")
+    for d in ("script-src", "style-src", "img-src", "font-src", "connect-src", "form-action"):
+        directives[d].add("'self'")
+    # data: in img-src / font-src is widely safe and almost universally needed
+    # (favicons, inline SVGs in CSS, icon-font libraries like FontAwesome /
+    # Phosphor / Lucide that ship base64 WOFF). Omitting it routinely breaks
+    # otherwise-strict policies on real-world pages.
+    directives["img-src"].add("data:")
+    directives["font-src"].add("data:")
+    return directives
+
+
+def _collect_csp_sources_static(url, html_content, strict=True):
     """
+    Walk the HTML with BeautifulSoup and collect external origins grouped by CSP
+    directive. In strict mode, inline blocks / event handlers / eval() are recorded
+    as warnings only — 'unsafe-inline' and 'unsafe-eval' are NOT added to the policy.
+
+    Returns: (directives_dict, notes_set, inline_flags) or (None, set(), {})
+    on parse failure. inline_flags is a dict with boolean keys:
+      'inline_script', 'inline_style', 'eval', 'inline_event_handler'.
+    """
+    inline_flags = {
+        "inline_script": False,
+        "inline_style": False,
+        "eval": False,
+        "inline_event_handler": False,
+        "has_script_bundles": False,
+    }
+    inline_hashes = {"script-src": set(), "style-src": set()}
     try:
         soup = BeautifulSoup(html_content, "html.parser")
     except Exception:
-        return None, []
+        return None, set(), inline_flags, inline_hashes
 
     parsed = urlparse(url)
     base_origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.netloc else ""
     base_scheme = parsed.scheme or "https"
 
-    directives = {d: set() for d in CSP_DIRECTIVE_ORDER}
-    directives["default-src"].add("'self'")
-    directives["object-src"].add("'none'")
-    directives["base-uri"].add("'self'")
-    directives["frame-ancestors"].add("'self'")
-    # 'self' is a safe baseline for the standard resource directives — the page may
-    # load same-origin assets the static scan didn't observe.
-    for d in ("script-src", "style-src", "img-src", "font-src", "connect-src", "form-action"):
-        directives[d].add("'self'")
-
+    directives = _empty_directives()
     notes = set()
 
     def add(directive, raw_src):
@@ -681,19 +788,36 @@ def generate_csp_from_page(url, html_content):
     for tag in soup.find_all("script"):
         src = tag.get("src")
         if src:
+            inline_flags["has_script_bundles"] = True
             add("script-src", src)
         else:
-            body = (tag.string or "").strip()
-            if body:
-                directives["script-src"].add("'unsafe-inline'")
-                notes.add(
-                    "Inline <script> blocks detected — prefer nonces or hashes over 'unsafe-inline'."
-                )
-                if re.search(r"\beval\s*\(|new\s+Function\s*\(", body):
-                    directives["script-src"].add("'unsafe-eval'")
+            body = tag.string or ""
+            if body.strip():
+                inline_flags["inline_script"] = True
+                inline_hashes["script-src"].add(_csp_sha256(body))
+                if strict:
                     notes.add(
-                        "eval() or new Function() usage detected — required 'unsafe-eval'; refactor to avoid it."
+                        "Inline <script> blocks detected — policy will block them. "
+                        "Fix by moving JS into external files, or by adding a per-request nonce "
+                        "(script-src 'self' 'nonce-RANDOM') and setting nonce=\"RANDOM\" on each <script>."
                     )
+                else:
+                    directives["script-src"].add("'unsafe-inline'")
+                    notes.add(
+                        "Inline <script> blocks detected — prefer nonces or hashes over 'unsafe-inline'."
+                    )
+                if re.search(r"\beval\s*\(|new\s+Function\s*\(", body):
+                    inline_flags["eval"] = True
+                    if strict:
+                        notes.add(
+                            "eval() or new Function() detected — policy will block them. "
+                            "Refactor to avoid dynamic code evaluation."
+                        )
+                    else:
+                        directives["script-src"].add("'unsafe-eval'")
+                        notes.add(
+                            "eval() or new Function() usage detected — required 'unsafe-eval'; refactor to avoid it."
+                        )
                 # Detect fetch/XHR/WebSocket targets for connect-src
                 for u in re.findall(
                     r"""(?:fetch|\.open|new\s+WebSocket|new\s+EventSource)\s*\(\s*['"]([^'"]+)['"]""",
@@ -737,13 +861,12 @@ def generate_csp_from_page(url, html_content):
                 add("style-src", href)
 
     # Inline <style> blocks + style="" attributes
+    inline_style_seen = False
     for tag in soup.find_all("style"):
         body = tag.string or ""
         if body.strip():
-            directives["style-src"].add("'unsafe-inline'")
-            notes.add(
-                "Inline <style> blocks detected — prefer nonces or hashes over 'unsafe-inline'."
-            )
+            inline_style_seen = True
+            inline_hashes["style-src"].add(_csp_sha256(body))
         for font_url in re.findall(
             r"url\(\s*['\"]?([^)'\"]+)['\"]?\s*\)", body, re.IGNORECASE
         ):
@@ -752,10 +875,19 @@ def generate_csp_from_page(url, html_content):
             elif font_url.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp")):
                 add("img-src", font_url)
     if soup.find(attrs={"style": True}):
-        directives["style-src"].add("'unsafe-inline'")
-        notes.add(
-            "Inline style attributes detected — prefer nonces or hashes over 'unsafe-inline'."
-        )
+        inline_style_seen = True
+    if inline_style_seen:
+        inline_flags["inline_style"] = True
+        if strict:
+            notes.add(
+                "Inline <style> blocks or style=\"\" attributes detected — policy will block them. "
+                "Fix by moving CSS into external files, or add a nonce to style-src and the <style> tags."
+            )
+        else:
+            directives["style-src"].add("'unsafe-inline'")
+            notes.add(
+                "Inline <style>/style=\"\" detected — prefer nonces or hashes over 'unsafe-inline'."
+            )
 
     # Images / media / frames / forms
     for tag in soup.find_all("img"):
@@ -771,7 +903,9 @@ def generate_csp_from_page(url, html_content):
             if candidate:
                 add("img-src", candidate)
     for tag in soup.find_all(["iframe", "frame"]):
-        add("frame-src", tag.get("src"))
+        src = tag.get("src")
+        if src:
+            add("frame-src", src)
     for tag in soup.find_all(["video", "audio"]):
         add("media-src", tag.get("src"))
         for source in tag.find_all("source"):
@@ -784,23 +918,147 @@ def generate_csp_from_page(url, html_content):
             directives["object-src"].discard("'none'")
             add("object-src", src)
 
-    # Inline event handlers force 'unsafe-inline' for scripts
+    # Inline event handlers
     for tag in soup.find_all(True):
         for attr in list(tag.attrs.keys()):
             if attr.lower().startswith("on") and attr.lower() not in ("once",):
-                directives["script-src"].add("'unsafe-inline'")
-                notes.add(
-                    "Inline event handlers (onclick, onload, etc.) detected — "
-                    "these require 'unsafe-inline' for scripts; migrate to addEventListener."
-                )
+                inline_flags["inline_event_handler"] = True
+                if strict:
+                    notes.add(
+                        "Inline event handlers (onclick, onload, etc.) detected — policy will block them. "
+                        "Migrate to addEventListener() to keep a strict script-src."
+                    )
+                else:
+                    directives["script-src"].add("'unsafe-inline'")
+                    notes.add(
+                        "Inline event handlers detected — require 'unsafe-inline'; migrate to addEventListener."
+                    )
                 break
 
-    # Backfill empty directives with sensible defaults
-    for d in ("script-src", "style-src", "img-src", "font-src", "connect-src"):
-        if not directives[d]:
-            directives[d].add("'self'")
+    return directives, notes, inline_flags, inline_hashes
 
-    # Build the CSP string in canonical order, omitting any directive with no sources
+
+def _collect_csp_sources_dynamic(url, timeout=15):
+    """
+    Load the URL in a headless Chromium via Playwright and capture:
+      (a) every network request grouped by Playwright's resource_type
+      (b) every inline <script>/<style> in the LIVE DOM after navigation —
+          this catches content injected at runtime by frameworks like React,
+          which static HTML scanning misses entirely.
+
+    Returns: (directives_dict, notes_set, inline_hashes_dict)
+             or (None, {error_note}, {}) on failure.
+
+    Requires: pip install playwright && playwright install chromium
+    """
+    inline_hashes = {"script-src": set(), "style-src": set()}
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return None, {
+            "--deep requested but Playwright is not installed. "
+            "Run: pip install playwright && playwright install chromium"
+        }, inline_hashes
+
+    parsed = urlparse(url)
+    base_origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.netloc else ""
+    base_scheme = parsed.scheme or "https"
+
+    directives = _empty_directives()
+    notes = set()
+
+    # Playwright resource_type → CSP directive
+    resource_map = {
+        "script": "script-src",
+        "stylesheet": "style-src",
+        "image": "img-src",
+        "font": "font-src",
+        "fetch": "connect-src",
+        "xhr": "connect-src",
+        "websocket": "connect-src",
+        "eventsource": "connect-src",
+        "media": "media-src",
+        "manifest": "connect-src",
+    }
+
+    def on_request(req):
+        directive = resource_map.get(req.resource_type)
+        if not directive:
+            if req.frame and req.frame != req.frame.page.main_frame:
+                directive = "frame-src"
+            else:
+                return
+        token = _csp_resolve_source(req.url, base_origin, base_scheme)
+        if token:
+            directives[directive].add(token)
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            try:
+                context = browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/125.0.0.0 Safari/537.36"
+                    )
+                )
+                page = context.new_page()
+                page.on("request", on_request)
+                page.goto(url, wait_until="networkidle", timeout=timeout * 1000)
+
+                # SPA frameworks (React, Vue) frequently inject styles AFTER
+                # networkidle fires. Give the page another moment to settle so
+                # we capture late-arriving inline content before hashing.
+                try:
+                    page.wait_for_timeout(1500)
+                except Exception:
+                    pass
+
+                # Pull every inline <script> and <style> from the LIVE DOM
+                # (catches runtime-injected content like React style-loader output).
+                inline_blocks = page.evaluate(
+                    """() => {
+                        const scripts = Array.from(document.querySelectorAll('script:not([src])'))
+                            .map(el => el.textContent)
+                            .filter(t => t && t.trim());
+                        const styles = Array.from(document.querySelectorAll('style'))
+                            .map(el => el.textContent)
+                            .filter(t => t && t.trim());
+                        return { scripts, styles };
+                    }"""
+                )
+                for body in inline_blocks.get("scripts", []) or []:
+                    inline_hashes["script-src"].add(_csp_sha256(body))
+                for body in inline_blocks.get("styles", []) or []:
+                    inline_hashes["style-src"].add(_csp_sha256(body))
+            finally:
+                browser.close()
+    except Exception as e:
+        notes.add(f"Deep scan via Playwright failed: {str(e)[:200]}")
+        return None, notes, inline_hashes
+
+    return directives, notes, inline_hashes
+
+
+def _merge_directives(*directive_dicts):
+    """Union directive→origin sets across multiple collectors."""
+    merged = _empty_directives()
+    for d in directive_dicts:
+        if not d:
+            continue
+        for key, sources in d.items():
+            merged.setdefault(key, set()).update(sources)
+    return merged
+
+
+def _render_csp(directives):
+    """Render directive dict as a canonical CSP header string."""
+    # Backfill empty resource directives with 'self'
+    for d in ("script-src", "style-src", "img-src", "font-src", "connect-src"):
+        if not directives.get(d):
+            directives.setdefault(d, set()).add("'self'")
+
     parts = []
     for d in CSP_DIRECTIVE_ORDER:
         sources = directives.get(d)
@@ -808,14 +1066,162 @@ def generate_csp_from_page(url, html_content):
             continue
         token_list = sorted(sources, key=_csp_sort_key)
         parts.append(f"{d} {' '.join(token_list)}")
+    parts.append("upgrade-insecure-requests")
+    return "; ".join(parts)
 
-    return "; ".join(parts), sorted(notes)
+
+def generate_csp_from_page(url, html_content, deep=False, timeout=15, strict=True):
+    """
+    Analyze a page and return three CSP variants plus notes:
+
+      - strict   — no 'unsafe-inline' / 'unsafe-eval'. Goal state.
+      - practical — includes 'unsafe-inline' (and 'unsafe-eval' if needed).
+                    Works immediately but penalised by Bitsight/SecurityScorecard.
+      - hashed    — 'sha256-XYZ=' tokens for each detected inline block instead
+                    of 'unsafe-inline'. Bitsight-friendly and works for pages
+                    you cannot refactor.
+
+    Args:
+        url, html_content, deep, timeout, strict — as before. The 'hashed'
+        variant is most accurate with deep=True because it captures content
+        that JS injects at runtime (e.g. MinIO's React style-loader output).
+
+    Returns: (strict_csp, practical_csp_or_None, hashed_csp_or_None, notes_list).
+             Returns (None, None, None, []) if static parsing fails.
+             practical_csp / hashed_csp are None when no inline content was
+             detected — the strict policy is sufficient.
+             The 5th element is the inline-content flags dict (used by the
+             nginx nonce template to decide whether to add 'unsafe-eval').
+    """
+    static_directives, static_notes, inline_flags, inline_hashes = (
+        _collect_csp_sources_static(url, html_content, strict=strict)
+    )
+    if static_directives is None:
+        return None, None, None, [], {}
+
+    if deep:
+        dyn_directives, dyn_notes, dyn_hashes = _collect_csp_sources_dynamic(
+            url, timeout=timeout
+        )
+        directives = _merge_directives(static_directives, dyn_directives)
+        notes = static_notes | dyn_notes
+        # Merge hashes from the live DOM (captures JS-injected styles/scripts).
+        for key in ("script-src", "style-src"):
+            inline_hashes[key].update(dyn_hashes.get(key, set()))
+            if dyn_hashes.get(key):
+                if key == "style-src":
+                    inline_flags["inline_style"] = True
+                else:
+                    inline_flags["inline_script"] = True
+    else:
+        directives = static_directives
+        notes = static_notes
+
+    strict_csp = _render_csp({k: set(v) for k, v in directives.items()})
+
+    needs_unsafe_inline_script = inline_flags["inline_script"] or inline_flags["inline_event_handler"]
+    needs_unsafe_inline_style = inline_flags["inline_style"]
+    needs_unsafe_eval = inline_flags["eval"]
+
+    # Practical: 'unsafe-inline' / 'unsafe-eval' as needed.
+    practical_csp = None
+    if needs_unsafe_inline_script or needs_unsafe_inline_style or needs_unsafe_eval:
+        practical = {k: set(v) for k, v in directives.items()}
+        if needs_unsafe_inline_script:
+            practical["script-src"].add("'unsafe-inline'")
+        if needs_unsafe_eval:
+            practical["script-src"].add("'unsafe-eval'")
+        if needs_unsafe_inline_style:
+            practical["style-src"].add("'unsafe-inline'")
+        practical_csp = _render_csp(practical)
+        notes.add(
+            "A practical CSP companion was emitted with 'unsafe-inline' (and "
+            "'unsafe-eval' if needed). Works immediately but penalised by "
+            "security-ratings services (Bitsight, SecurityScorecard). Prefer "
+            "the hash-based variant or the strict variant after refactoring."
+        )
+
+    # Hashed: SHA-256 tokens — Bitsight-friendly alternative to 'unsafe-inline'.
+    # Requires deep=True for accuracy on framework-driven pages, but still useful
+    # in static mode for fully server-rendered inline content.
+    hashed_csp = None
+    if inline_hashes["script-src"] or inline_hashes["style-src"]:
+        hashed = {k: set(v) for k, v in directives.items()}
+        for token in inline_hashes["script-src"]:
+            hashed["script-src"].add(token)
+        for token in inline_hashes["style-src"]:
+            hashed["style-src"].add(token)
+        # Inline event handlers cannot be allowed by hash — they require either
+        # 'unsafe-inline', 'unsafe-hashes' + per-handler hashes, or refactoring
+        # to addEventListener. Surface this so the user isn't surprised.
+        if inline_flags["inline_event_handler"]:
+            notes.add(
+                "Inline event handlers (onclick=, onload=) cannot be permitted "
+                "by SHA-256 hash on their own — the hashed CSP variant will "
+                "still block them. Options: (a) refactor to addEventListener "
+                "(recommended), (b) add 'unsafe-hashes' with per-handler hashes."
+            )
+        if needs_unsafe_eval:
+            notes.add(
+                "eval() / new Function() cannot be permitted by hash — the "
+                "hashed CSP still blocks them. Refactor to remove dynamic "
+                "code evaluation, or fall back to the practical variant."
+            )
+        hashed_csp = _render_csp(hashed)
+        notes.add(
+            f"Hash-based CSP variant emitted with "
+            f"{len(inline_hashes['script-src'])} script hash(es) and "
+            f"{len(inline_hashes['style-src'])} style hash(es). "
+            "Bitsight-friendly. Hashes are stable per page version — update "
+            "the CSP when the page is redeployed."
+        )
+        if not deep:
+            notes.add(
+                "Hash-based CSP was generated from the static HTML response "
+                "only. If the page injects styles/scripts at runtime (e.g. "
+                "React style-loader), re-run with --deep to capture them."
+            )
+        else:
+            notes.add(
+                "Deep capture: if blocks persist after applying this Hash-based "
+                "CSP, the inline content likely changes per request (dynamic "
+                "theming, user-specific values, timestamps). In that case "
+                "hashes can never be stable — use the Nginx Nonce Template "
+                "(also generated below) instead. Nonces work regardless of "
+                "content changes because nginx injects them at response time."
+            )
+    elif deep and inline_flags["has_script_bundles"]:
+        # --deep ran, no inline content captured, but the page loads JS bundles.
+        # Either the bundles don't inject inline content, OR they inject it
+        # later than our wait window. Surface both possibilities.
+        notes.add(
+            "Deep capture ran but found no inline scripts/styles in the live "
+            "DOM. If the page is a SPA and you still see CSP blocks, the bundle "
+            "may inject content after our wait window — extend the wait or use "
+            "the Nginx Nonce Template for a content-independent fix."
+        )
+
+    # Late top-level guidance for SPAs without --deep (the static collector saw
+    # script bundles but no static inline content, which is the common case
+    # for React/Vue/Angular apps).
+    if not deep and inline_flags["has_script_bundles"] and hashed_csp is None:
+        notes.add(
+            "The page loads JavaScript bundle(s) but no inline content was "
+            "found in the static HTML. SPAs (React/Vue/Angular) commonly "
+            "inject styles at runtime — those are invisible to a static scan. "
+            "Re-run with --deep so the scanner can capture them and emit a "
+            "hash-based CSP, or use the Nginx Nonce Template for the most "
+            "robust answer."
+        )
+
+    return strict_csp, practical_csp, hashed_csp, sorted(notes), dict(inline_flags)
 
 
 # ─────────────────────────────────────────────
 # Main Scanner
 # ─────────────────────────────────────────────
-def scan_url(url, session, use_retire=False, timeout=15, skip_csp=False):
+def scan_url(url, session, use_retire=False, timeout=15, skip_csp=False,
+             gen_csp=False, deep=False):
     """Scan a single URL for security issues."""
     # Normalize URL
     if not url.startswith(("http://", "https://")):
@@ -827,6 +1233,9 @@ def scan_url(url, session, use_retire=False, timeout=15, skip_csp=False):
         "header_findings": [],
         "js_findings": [],
         "csp_suggestion": None,
+        "csp_suggestion_practical": None,
+        "csp_suggestion_hashed": None,
+        "csp_inline_flags": {},
         "csp_notes": [],
     }
 
@@ -859,7 +1268,7 @@ def scan_url(url, session, use_retire=False, timeout=15, skip_csp=False):
             if f not in existing:
                 result["js_findings"].append(f)
 
-        # 3) Auto-generate a tailored CSP recommendation when CSP is missing or misconfigured
+        # 3) Auto-generate a tailored CSP recommendation
         if not skip_csp:
             csp_present = response.headers.get("Content-Security-Policy")
             csp_needs_help = (
@@ -870,14 +1279,28 @@ def scan_url(url, session, use_retire=False, timeout=15, skip_csp=False):
                     for f in result["header_findings"]
                 )
             )
-            if csp_needs_help and html_content:
-                csp_suggestion, csp_notes = generate_csp_from_page(url, html_content)
-                if csp_suggestion:
-                    result["csp_suggestion"] = csp_suggestion
+            should_generate = gen_csp or csp_needs_help
+            if should_generate and html_content:
+                csp_strict, csp_practical, csp_hashed, csp_notes, csp_flags = generate_csp_from_page(
+                    url, html_content, deep=deep, timeout=timeout, strict=True
+                )
+                if csp_strict:
+                    result["csp_suggestion"] = csp_strict
+                    result["csp_suggestion_practical"] = csp_practical
+                    result["csp_suggestion_hashed"] = csp_hashed
+                    result["csp_inline_flags"] = csp_flags
                     result["csp_notes"] = csp_notes
                     result["header_findings"].append(
-                        f"[INFO] Content-Security-Policy: Auto-generated suggestion based on page content: {csp_suggestion}"
+                        f"[INFO] Content-Security-Policy (Strict, recommended): {csp_strict}"
                     )
+                    if csp_hashed:
+                        result["header_findings"].append(
+                            f"[INFO] Content-Security-Policy (Hash-based, Bitsight-friendly): {csp_hashed}"
+                        )
+                    if csp_practical:
+                        result["header_findings"].append(
+                            f"[INFO] Content-Security-Policy (Practical, works without refactoring): {csp_practical}"
+                        )
                     for note in csp_notes:
                         result["header_findings"].append(f"[INFO] CSP note: {note}")
 
@@ -1138,6 +1561,111 @@ def build_nginx_config(result):
     return "\n".join(lines)
 
 
+def build_nginx_nonce_template(result):
+    """
+    Render a ready-to-paste nginx config that uses per-request nonces +
+    'strict-dynamic' instead of 'unsafe-inline'. This is the Bitsight-friendly
+    way to handle pages that contain inline scripts/styles you cannot refactor
+    (e.g. a vendored MinIO console).
+
+    Returns '' when the page has no inline content (the strict CSP is enough).
+    """
+    csp = result.get("csp_suggestion")
+    if not csp:
+        return ""
+    # If neither practical nor hashed variants exist, the page has no inline
+    # content — a nonce template would add complexity without benefit.
+    if not (result.get("csp_suggestion_practical") or result.get("csp_suggestion_hashed")):
+        return ""
+
+    # Pull external origins out of the strict CSP so we can keep them in the
+    # nonce variant. (Quick-and-dirty — re-parses our own output.)
+    extra_script_origins = []
+    extra_style_origins = []
+    extra_img_sources = []
+    extra_font_sources = []
+    extra_connect_origins = []
+    for directive in csp.split("; "):
+        parts = directive.split()
+        if not parts:
+            continue
+        name, tokens = parts[0], parts[1:]
+        externals = [t for t in tokens if t.startswith(("http://", "https://", "data:", "blob:"))]
+        if name == "script-src":
+            extra_script_origins.extend(externals)
+        elif name == "style-src":
+            extra_style_origins.extend(externals)
+        elif name == "img-src":
+            extra_img_sources.extend(externals)
+        elif name == "font-src":
+            extra_font_sources.extend(externals)
+        elif name == "connect-src":
+            extra_connect_origins.extend(externals)
+
+    # Don't re-emit tokens that the template already hard-codes in its baseline
+    # (otherwise we get e.g. "img-src 'self' data: blob: data:").
+    _baseline_tokens = {"'self'", "'none'", "data:", "blob:"}
+
+    def _join(extras):
+        filtered = sorted({t for t in extras if t not in _baseline_tokens})
+        return (" " + " ".join(filtered)) if filtered else ""
+
+    # eval() / new Function() can ONLY be allowed by 'unsafe-eval' — neither
+    # nonces, hashes, nor 'strict-dynamic' permit them. If the page uses eval,
+    # the nonce template must include 'unsafe-eval' or the page breaks.
+    inline_flags = result.get("csp_inline_flags") or {}
+    unsafe_eval_token = " 'unsafe-eval'" if inline_flags.get("eval") else ""
+    eval_comment = ""
+    if inline_flags.get("eval"):
+        eval_comment = (
+            "\n# NOTE: 'unsafe-eval' is included because the page was observed using "
+            "eval()/new Function().\n"
+            "# This is unavoidable without modifying the application source. "
+            "Bitsight penalises\n"
+            "# 'unsafe-eval' less than 'unsafe-inline' (no HTML-injection surface).\n"
+        )
+
+    template = f"""# Nginx + per-request CSP nonce — Bitsight/SecurityScorecard-friendly
+# alternative to 'unsafe-inline'. Generated for: {result['url']}
+#
+# Requirements (one of):
+#   - nginx-extras package (apt install nginx-extras) for set_secure_random_alphanum
+#   - OR OpenResty / nginx + lua-nginx-module
+#
+# Place inside the relevant 'location' or 'server' block.
+{eval_comment}
+# 1. Fresh 32-char nonce for every request.
+set_secure_random_alphanum $cspNonce 32;
+
+# 2. Disable upstream compression so sub_filter can rewrite the response body.
+proxy_set_header Accept-Encoding "";
+
+# 3. Inject nonce into every <script> and <style> tag.
+sub_filter_once off;
+sub_filter_types text/html;
+sub_filter '<script'  '<script nonce="$cspNonce"';
+sub_filter '<style'   '<style nonce="$cspNonce"';
+
+# 4. CSP using 'nonce-...' + 'strict-dynamic'. The nonce-allowed root script
+#    can then load other scripts transitively without origin allowlisting.
+add_header Content-Security-Policy "\\
+default-src 'self'; \\
+script-src 'nonce-$cspNonce' 'strict-dynamic'{unsafe_eval_token}{_join(extra_script_origins)}; \\
+style-src 'nonce-$cspNonce'{_join(extra_style_origins)}; \\
+img-src 'self' data: blob:{_join(extra_img_sources)}; \\
+font-src 'self' data:{_join(extra_font_sources)}; \\
+connect-src 'self'{_join(extra_connect_origins)}; \\
+object-src 'none'; base-uri 'self'; frame-ancestors 'self'; \\
+upgrade-insecure-requests; block-all-mixed-content; \\
+require-trusted-types-for 'script'\\
+" always;
+
+# Keep Referrer-Policy on its OWN header — it is NOT a CSP directive.
+add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+"""
+    return template
+
+
 def format_config_examples(result):
     """Combined Apache + Nginx snippet block for plain-text output."""
     apache = build_apache_config(result)
@@ -1223,8 +1751,13 @@ def write_csv(output_path, results):
             "Low",
             "Results",
             "Recommendations",
+            "Generated CSP (Strict)",
+            "Generated CSP (Hash-based)",
+            "Generated CSP (Practical)",
+            "CSP Warnings",
             "Apache Config",
             "Nginx Config",
+            "Nginx Nonce Template",
         ])
 
         for result in sorted(results, key=lambda x: x["url"]):
@@ -1232,6 +1765,7 @@ def write_csv(output_path, results):
             recs = generate_recommendations(result)
             recs_text = "\n".join(f"- {r}" for r in recs) if recs else ""
             critical, high, medium, low = count_severities(result)
+            csp_warnings = "\n".join(f"- {n}" for n in result.get("csp_notes", []))
             writer.writerow([
                 result["url"],
                 "YES" if has_issues(result) else "NO",
@@ -1241,39 +1775,238 @@ def write_csv(output_path, results):
                 low,
                 formatted,
                 recs_text,
+                result.get("csp_suggestion") or "",
+                result.get("csp_suggestion_hashed") or "",
+                result.get("csp_suggestion_practical") or "",
+                csp_warnings,
                 build_apache_config(result),
                 build_nginx_config(result),
+                build_nginx_nonce_template(result),
             ])
 
 
-def write_txt(output_path, results):
-    """Write results to a human-readable plain text file."""
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write("=" * 70 + "\n")
-        f.write("Web Security Scanner - Results\n")
-        f.write("=" * 70 + "\n\n")
+REPORT_WIDTH = 78
 
-        for result in sorted(results, key=lambda x: x["url"]):
-            critical, high, medium, low = count_severities(result)
-            issues_flag = "YES" if has_issues(result) else "NO"
 
-            f.write("-" * 70 + "\n")
-            f.write(f"URL: {result['url']}\n")
-            f.write(f"Has Issues: {issues_flag}\n")
+def _format_csp_pretty(csp_value, indent="      "):
+    """
+    Pretty-print a CSP header value. Splits directives onto separate lines and
+    wraps long source lists (hashes, multiple origins) so each token is on its
+    own line under its directive. Returns '' if input is empty.
+    """
+    if not csp_value:
+        return ""
+    directives = [d.strip() for d in csp_value.split(";") if d.strip()]
+    if not directives:
+        return ""
+    name_width = max(len(d.split(maxsplit=1)[0]) for d in directives)
+
+    lines = []
+    for i, directive in enumerate(directives):
+        parts = directive.split()
+        name = parts[0]
+        tokens = parts[1:]
+        terminator = ";" if i < len(directives) - 1 else ""
+
+        if not tokens:
+            lines.append(f"{indent}{name}{terminator}")
+            continue
+
+        one_line = f"{indent}{name.ljust(name_width)} {' '.join(tokens)}{terminator}"
+        if len(one_line) <= REPORT_WIDTH + 20:
+            lines.append(one_line)
+            continue
+
+        # Wrap: directive name + first token on line 1, remaining tokens stacked under
+        lines.append(f"{indent}{name.ljust(name_width)} {tokens[0]}")
+        inner_indent = " " * (len(indent) + name_width + 1)
+        for t in tokens[1:-1]:
+            lines.append(f"{inner_indent}{t}")
+        lines.append(f"{inner_indent}{tokens[-1]}{terminator}")
+    return "\n".join(lines)
+
+
+def _split_header_findings(header_findings):
+    """
+    Bucket findings by severity. [INFO] entries are dropped because they
+    duplicate the structured csp_suggestion / csp_notes fields, which we render
+    in dedicated sections.
+    """
+    buckets = {"critical": [], "high": [], "medium": [], "low": [], "ok": []}
+    for f in header_findings:
+        for sev in ("critical", "high", "medium", "low", "ok"):
+            tag = f"[{sev.upper()}]"
+            if f.startswith(tag):
+                buckets[sev].append(f[len(tag):].lstrip())
+                break
+    return buckets
+
+
+def _wrap_indented(text, first_prefix, width=REPORT_WIDTH):
+    """Wrap `text` so the first line starts with `first_prefix` and continuation
+    lines are indented under it."""
+    return textwrap.fill(
+        text,
+        width=width,
+        initial_indent=first_prefix,
+        subsequent_indent=" " * len(first_prefix),
+        break_long_words=False,
+        break_on_hyphens=False,
+    )
+
+
+def _section_header(title):
+    return f"{title}\n{'-' * REPORT_WIDTH}\n"
+
+
+def _write_url_section(f, result):
+    crit, high, med, low = count_severities(result)
+    f.write("=" * REPORT_WIDTH + "\n")
+    f.write(f"  {result['url']}\n")
+    f.write(
+        f"  HTTP {result['status']}  |  "
+        f"{crit} CRITICAL  |  {high} HIGH  |  {med} MEDIUM  |  {low} LOW\n"
+    )
+    f.write("=" * REPORT_WIDTH + "\n\n")
+
+    buckets = _split_header_findings(result["header_findings"])
+
+    # ── ISSUES TO FIX ──
+    issues_exist = any(buckets[s] for s in ("critical", "high", "medium", "low"))
+    if issues_exist:
+        f.write(_section_header("ISSUES TO FIX"))
+        for sev in ("critical", "high", "medium", "low"):
+            for msg in buckets[sev]:
+                tag = f"[{sev.upper()}]"
+                f.write(_wrap_indented(msg, f"  {tag.ljust(9)} ") + "\n\n")
+
+    # ── HEADERS PASSING (compact list) ──
+    if buckets["ok"]:
+        ok_names = []
+        for line in buckets["ok"]:
+            header_name = line.split(":", 1)[0].strip()
+            ok_names.append(header_name)
+        f.write(_section_header(f"HEADERS PASSING ({len(ok_names)})"))
+        # Two columns when the list is long
+        if len(ok_names) >= 6:
+            mid = (len(ok_names) + 1) // 2
+            col1 = ok_names[:mid]
+            col2 = ok_names[mid:]
+            colw = max((len(n) for n in col1), default=0) + 4
+            for i in range(mid):
+                left = f"[OK] {col1[i]}"
+                right = f"[OK] {col2[i]}" if i < len(col2) else ""
+                f.write(f"  {left.ljust(colw + 5)}{right}\n")
+        else:
+            for n in ok_names:
+                f.write(f"  [OK] {n}\n")
+        f.write("\n")
+
+    # ── JAVASCRIPT LIBRARIES ──
+    if result["js_findings"]:
+        f.write(_section_header("JAVASCRIPT LIBRARIES"))
+        for js in result["js_findings"]:
+            f.write(f"  {js}\n")
+        f.write("\n")
+
+    # ── RECOMMENDED CSP ──
+    strict = result.get("csp_suggestion")
+    hashed = result.get("csp_suggestion_hashed")
+    practical = result.get("csp_suggestion_practical")
+    if strict:
+        f.write(_section_header("RECOMMENDED CSP — pick one option to apply"))
+        f.write(
+            "  [Option A] Strict — no 'unsafe-inline'. Best Bitsight score.\n"
+            "             WARNING: blocks any inline scripts/styles the page uses.\n"
+        )
+        f.write("  Content-Security-Policy:\n")
+        f.write(_format_csp_pretty(strict, indent="      ") + "\n\n")
+
+        if hashed:
             f.write(
-                f"Severity Counts: {critical} CRITICAL | {high} HIGH | "
-                f"{medium} MEDIUM | {low} LOW\n"
+                "  [Option B] Hash-based — Bitsight-friendly without breaking inline\n"
+                "             content. Hashes drift if MinIO/page injects dynamic\n"
+                "             content per request; re-scan after each upgrade.\n"
             )
-            f.write("-" * 70 + "\n")
-            f.write(format_findings(result) + "\n\n")
+            f.write("  Content-Security-Policy:\n")
+            f.write(_format_csp_pretty(hashed, indent="      ") + "\n\n")
 
-            f.write("--- Recommendations ---\n")
-            f.write(format_recommendations(result) + "\n\n")
+        if practical:
+            f.write(
+                "  [Option C] Practical — works immediately. Includes\n"
+                "             'unsafe-inline'/'unsafe-eval'. Bitsight will downgrade\n"
+                "             the score for these tokens.\n"
+            )
+            f.write("  Content-Security-Policy:\n")
+            f.write(_format_csp_pretty(practical, indent="      ") + "\n\n")
 
-            example_cfg = format_config_examples(result)
-            if example_cfg:
-                f.write("--- Example Server Configurations ---\n")
-                f.write(example_cfg + "\n\n")
+    # ── CSP WARNINGS ──
+    notes = result.get("csp_notes") or []
+    if notes:
+        f.write(_section_header("CSP WARNINGS"))
+        for note in notes:
+            f.write(_wrap_indented(note, "  - ") + "\n\n")
+
+    # ── READY-TO-PASTE SERVER CONFIG ──
+    apache = build_apache_config(result)
+    nginx = build_nginx_config(result)
+    nonce = build_nginx_nonce_template(result)
+    if apache or nginx or nonce:
+        f.write(_section_header("READY-TO-PASTE SERVER CONFIG"))
+        if nginx:
+            f.write("  --- Nginx ---\n")
+            for line in nginx.split("\n"):
+                f.write(f"  {line}\n" if line else "\n")
+            f.write("\n")
+        if apache:
+            f.write("  --- Apache ---\n")
+            for line in apache.split("\n"):
+                f.write(f"  {line}\n" if line else "\n")
+            f.write("\n")
+        if nonce:
+            f.write("  --- Nginx Nonce Template (BEST for Bitsight) ---\n")
+            for line in nonce.split("\n"):
+                f.write(f"  {line}\n" if line else "\n")
+            f.write("\n")
+
+    f.write("\n")
+
+
+def write_txt(output_path, results):
+    """Write results in a structured, human-readable layout."""
+    sorted_results = sorted(results, key=lambda x: x["url"])
+    with open(output_path, "w", encoding="utf-8") as f:
+        # ── Report header ──
+        f.write("=" * REPORT_WIDTH + "\n")
+        f.write("  Web Security Scanner — Report\n")
+        f.write(f"  Generated: {date.today().isoformat()}  |  URLs scanned: {len(sorted_results)}\n")
+        f.write("=" * REPORT_WIDTH + "\n\n")
+
+        # ── Executive summary ──
+        f.write(_section_header("SUMMARY"))
+        for result in sorted_results:
+            crit, high, med, low = count_severities(result)
+            parts = []
+            if crit:
+                parts.append(f"{crit}C")
+            if high:
+                parts.append(f"{high}H")
+            if med:
+                parts.append(f"{med}M")
+            if low:
+                parts.append(f"{low}L")
+            issues_compact = "/".join(parts) if parts else "clean"
+            url_short = result["url"]
+            if len(url_short) > 55:
+                url_short = url_short[:52] + "..."
+            status_str = f"HTTP {result['status']}"
+            f.write(f"  {url_short:<55}  {status_str:<10}  {issues_compact}\n")
+        f.write("\n")
+        f.write("  Legend: C=Critical  H=High  M=Medium  L=Low\n\n")
+
+        # ── Per-URL details ──
+        for result in sorted_results:
+            _write_url_section(f, result)
 
 
 def main():
@@ -1286,6 +2019,8 @@ Examples:
   %(prog)s -i urls.txt -o results.txt --format txt        (human-readable plain text)
   %(prog)s -i urls.txt -o results.csv --timeout 20 --threads 5
   %(prog)s -i urls.txt -o results.csv --retire            (use retire.js if installed)
+  %(prog)s -i urls.txt -o results.csv --gen-csp           (auto-generate strict CSP per URL)
+  %(prog)s -i urls.txt -o results.csv --gen-csp --deep    (also capture JS-injected sources)
 
 Input file format (urls.txt):
   https://example.com
@@ -1321,6 +2056,19 @@ Input file format (urls.txt):
         "--no-csp",
         action="store_true",
         help="Skip Content-Security-Policy header checks (CSP is often hard for developers to fix)",
+    )
+    parser.add_argument(
+        "--gen-csp",
+        action="store_true",
+        help="Always auto-generate a strict CSP from observed page sources "
+             "(populates the 'Generated CSP' CSV column for every URL)",
+    )
+    parser.add_argument(
+        "--deep",
+        action="store_true",
+        help="Use headless Chromium (Playwright) to also capture JS-injected "
+             "resources for CSP generation. Requires: pip install playwright && "
+             "playwright install chromium",
     )
 
     args = parser.parse_args()
@@ -1362,9 +2110,19 @@ Input file format (urls.txt):
     print(f"[*] Scanning with {args.threads} thread(s), timeout={args.timeout}s...")
     print("-" * 60)
 
+    # Deep mode is single-threaded per URL via Playwright; warn if user combined them
+    if args.deep and args.threads > 1:
+        print(
+            "[!] --deep launches a headless browser per URL; consider --threads 1 "
+            "if you hit resource limits."
+        )
+
     with ThreadPoolExecutor(max_workers=args.threads) as executor:
         future_to_url = {
-            executor.submit(scan_url, url, session, use_retire, args.timeout, args.no_csp): url
+            executor.submit(
+                scan_url, url, session, use_retire, args.timeout, args.no_csp,
+                args.gen_csp, args.deep,
+            ): url
             for url in urls
         }
 
@@ -1397,6 +2155,9 @@ Input file format (urls.txt):
                         "header_findings": [f"[ERROR] {str(e)}"],
                         "js_findings": [],
                         "csp_suggestion": None,
+                        "csp_suggestion_practical": None,
+                        "csp_suggestion_hashed": None,
+                        "csp_inline_flags": {},
                         "csp_notes": [],
                     }
                 )

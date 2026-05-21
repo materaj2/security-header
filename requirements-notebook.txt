@@ -1,0 +1,7 @@
+# Notebook dependencies — required for: jupyter notebook web_security_scanner.ipynb
+# Install with:  pip install -r requirements-notebook.txt
+# (Automatically pulls in core requirements.txt too.)
+-r requirements.txt
+pandas>=2.0.0
+jupyter>=1.0.0
+ipykernel>=6.0.0
